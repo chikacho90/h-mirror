@@ -130,7 +130,7 @@ export function EnrollView() {
         )}
       </section>
 
-      <p style={mutedStyle}>
+      <p style={tipStyle}>
         Tip: 정면, 균일한 조명, 얼굴이 사진의 30% 이상인 사진을 사용하세요. 한 사람당 1장이면 충분하지만, 3-5장을 등록하면 인식률이 더 좋아집니다 (이름은 동일하게).
       </p>
     </div>
@@ -169,6 +169,10 @@ const inputStyle: React.CSSProperties = {
   color: '#fff', padding: '10px 12px', borderRadius: 6, fontSize: 14, outline: 'none',
 }
 const mutedStyle: React.CSSProperties = { opacity: 0.6, fontSize: 13 }
+const tipStyle: React.CSSProperties = {
+  maxWidth: 720, margin: '0 auto', padding: '4px 4px 24px',
+  opacity: 0.6, fontSize: 13, lineHeight: 1.5,
+}
 const messageStyle: React.CSSProperties = { fontSize: 13, marginTop: 4 }
 const previewStyle: React.CSSProperties = { maxWidth: 180, maxHeight: 180, borderRadius: 6, border: '1px solid rgba(255,255,255,0.15)' }
 const rowStyle: React.CSSProperties = {
