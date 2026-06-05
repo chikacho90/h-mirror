@@ -6,6 +6,9 @@ import {
   type ObjectDetectorResult,
   type ImageSegmenterResult,
 } from '@mediapipe/tasks-vision'
+import { EnrollView } from './EnrollView'
+import { extractAllEmbeddings, loadFaceModels } from './lib/faceApi'
+import { matchFace, type MatchResult } from './lib/supabase'
 
 const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm'
 const OBJ_MODEL = 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite'
@@ -21,7 +24,9 @@ const FS_UI_HIDE_MS = 3000
 const MASK_REFRESH_MS = 60
 const OBJECT_REFRESH_MS = 25
 const FPS_UPDATE_MS = 500
-const DESCRIPTION_REFRESH_MS = 400
+const FACE_REFRESH_MS = 700        // 얼굴 검출 + 임베딩 호출 주기 (≈1.4fps — DB 쿼리 부담 줄임)
+const MATCH_THRESHOLD = 0.3        // pgvector cosine similarity 컷오프
+const MATCH_TOP_K = 3
 
 type Status = 'idle' | 'loading-model' | 'requesting-camera' | 'running' | 'error'
 type BBox = { x: number; y: number; w: number; h: number }
@@ -37,11 +42,26 @@ type Track = {
   score: number
   firstSeenAt: number
   lastSeenAt: number
-  description: string
-  lastDescribedAt: number
+  matches: MatchResult[]
+  lastFaceProcessedAt: number
 }
 
 export default function App() {
+  const [view, setView] = useState<'recognize' | 'enroll'>(
+    typeof window !== 'undefined' && window.location.hash === '#enroll' ? 'enroll' : 'recognize'
+  )
+  useEffect(() => {
+    function onHash() {
+      setView(window.location.hash === '#enroll' ? 'enroll' : 'recognize')
+    }
+    window.addEventListener('hashchange', onHash)
+    return () => window.removeEventListener('hashchange', onHash)
+  }, [])
+  if (view === 'enroll') return <EnrollView />
+  return <RecognizeView />
+}
+
+function RecognizeView() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const detectorRef = useRef<ObjectDetector | null>(null)
@@ -74,7 +94,9 @@ export default function App() {
   const lastObjectTsRef = useRef(0)
   const fpsLastUpdateRef = useRef(0)
   const silhouetteCacheRef = useRef<{ canvas: HTMLCanvasElement; shape: ShapeMode; ts: number } | null>(null)
-  const samplerCanvasRef = useRef<HTMLCanvasElement>(document.createElement('canvas'))
+  const faceProcessingRef = useRef(false)
+  const lastFaceRunAtRef = useRef(0)
+  const [faceReady, setFaceReady] = useState(false)
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null
@@ -130,6 +152,10 @@ export default function App() {
         detectorRef.current = detector
         segmenterRef.current = segmenter
         setStatus('running')
+
+        // face-api 모델 비동기 로드 (실시간 인식용). 로딩 끝나면 인식 활성화
+        loadFaceModels().then(() => { if (!cancelled) setFaceReady(true) })
+          .catch((e) => console.warn('face-api load failed:', e))
 
         const loop = () => {
           if (cancelled) return
@@ -285,15 +311,19 @@ export default function App() {
       for (const t of tracksRef.current) drawBBox(ctx, t, vw, mirrored)
     }
 
-    for (const t of tracksRef.current) {
-      if (ts - t.lastDescribedAt >= DESCRIPTION_REFRESH_MS) {
-        t.description = computeAppearance(video, t.bbox, samplerCanvasRef.current)
-        t.lastDescribedAt = ts
-      }
+    // 얼굴 인식 — 트랙이 있고 충분히 시간이 지났을 때만 (전체 프레임에서 얼굴 검출 + 임베딩 + DB 매칭)
+    if (faceReady && tracksRef.current.length > 0 &&
+        !faceProcessingRef.current &&
+        ts - lastFaceRunAtRef.current >= FACE_REFRESH_MS) {
+      lastFaceRunAtRef.current = ts
+      faceProcessingRef.current = true
+      processFaceMatching(video, tracksRef.current).finally(() => {
+        faceProcessingRef.current = false
+      })
     }
 
     if (targetMode !== 'none') {
-      tracksRef.current.forEach((t, i) => drawDescribedLabel(ctx, t, i + 1, vw, mirrored))
+      tracksRef.current.forEach((t, i) => drawIdentityLabel(ctx, t, i + 1, vw, mirrored))
     }
   }
 
@@ -310,8 +340,11 @@ export default function App() {
         aria-label="Toggle status"
       />
       {statusVisible && (
-        <StatusOverlay status={status} errorMsg={errorMsg} fps={fps} trackCount={trackCount} />
+        <StatusOverlay status={status} errorMsg={errorMsg} fps={fps} trackCount={trackCount} faceReady={faceReady} />
       )}
+
+      {/* 우상단 Enroll 링크 — 등록 화면으로 */}
+      <a href="#enroll" style={enrollLinkStyle}>Enroll →</a>
 
       <BottomPanel
         open={panelOpen}
@@ -367,8 +400,8 @@ function updateTracks(
       score: det.score,
       firstSeenAt: now,
       lastSeenAt: now,
-      description: '',
-      lastDescribedAt: 0,
+      matches: [],
+      lastFaceProcessedAt: 0,
     })
   }
   for (let i = tracks.length - 1; i >= 0; i--) {
@@ -387,63 +420,43 @@ function iouOf(a: BBox, b: BBox): number {
 
 function lerp(a: number, b: number, t: number): number { return a + (b - a) * t }
 
-function computeAppearance(video: HTMLVideoElement, bbox: BBox, sampler: HTMLCanvasElement): string {
-  const sx = bbox.x + bbox.w * 0.3
-  const sy = bbox.y + bbox.h * 0.45
-  const sw = Math.max(1, bbox.w * 0.4)
-  const sh = Math.max(1, bbox.h * 0.20)
-  sampler.width = 16
-  sampler.height = 16
-  const sctx = sampler.getContext('2d', { willReadFrequently: true })!
+// 전체 비디오 프레임에서 얼굴 검출 + 임베딩 → DB 매칭 → 트랙에 결과 캐싱
+async function processFaceMatching(video: HTMLVideoElement, tracks: Track[]) {
+  let faces: Awaited<ReturnType<typeof extractAllEmbeddings>>
   try {
-    sctx.drawImage(video, sx, sy, sw, sh, 0, 0, 16, 16)
-  } catch { return 'Unknown' }
-  const img = sctx.getImageData(0, 0, 16, 16)
-  const data = img.data
-  let rSum = 0, gSum = 0, bSum = 0, count = 0
-  for (let i = 0; i < data.length; i += 4) {
-    rSum += data[i]; gSum += data[i + 1]; bSum += data[i + 2]; count++
+    faces = await extractAllEmbeddings(video)
+  } catch {
+    return
   }
-  const r = rSum / count, g = gSum / count, b = bSum / count
-  return `Wearing ${colorName(r, g, b)}`
-}
+  if (faces.length === 0) return
 
-function colorName(r: number, g: number, b: number): string {
-  const rn = r / 255, gn = g / 255, bn = b / 255
-  const max = Math.max(rn, gn, bn), min = Math.min(rn, gn, bn)
-  const l = (max + min) / 2
-  let h = 0, s = 0
-  if (max !== min) {
-    const d = max - min
-    s = l > 0.5 ? d / (2 - max - min) : d / (max + min)
-    switch (max) {
-      case rn: h = (gn - bn) / d + (gn < bn ? 6 : 0); break
-      case gn: h = (bn - rn) / d + 2; break
-      case bn: h = (rn - gn) / d + 4; break
+  // 각 face의 중심을 가장 가까운 트랙의 head 영역(상단 35%)에 매칭
+  for (const face of faces) {
+    const fcx = face.box.x + face.box.width / 2
+    const fcy = face.box.y + face.box.height / 2
+    let best: Track | null = null
+    let bestDist = Infinity
+    for (const t of tracks) {
+      const headCx = t.bbox.x + t.bbox.w / 2
+      const headCy = t.bbox.y + Math.min(t.bbox.h * 0.25, face.box.height * 0.8)
+      const d = Math.hypot(fcx - headCx, fcy - headCy)
+      // 트랙 박스 안에 있거나 가까이 있어야
+      const inside = fcx >= t.bbox.x && fcx <= t.bbox.x + t.bbox.w &&
+                     fcy >= t.bbox.y && fcy <= t.bbox.y + t.bbox.h * 0.6
+      const dScore = inside ? d * 0.5 : d
+      if (dScore < bestDist) { bestDist = dScore; best = t }
     }
-    h /= 6
+    if (!best) continue
+
+    // DB 매칭 — face descriptor를 vector array로 변환
+    try {
+      const results = await matchFace(Array.from(face.descriptor), MATCH_TOP_K, MATCH_THRESHOLD)
+      best.matches = results
+      best.lastFaceProcessedAt = performance.now()
+    } catch {
+      // skip on transient errors
+    }
   }
-  const hue = h * 360
-  if (l < 0.15) return 'black'
-  if (l > 0.92 && s < 0.15) return 'white'
-  if (s < 0.12) {
-    if (l > 0.72) return 'light gray'
-    if (l > 0.42) return 'gray'
-    return 'dark gray'
-  }
-  let name = 'mixed'
-  if (hue < 15 || hue >= 345) name = 'red'
-  else if (hue < 35) name = 'orange'
-  else if (hue < 55) name = 'yellow'
-  else if (hue < 85) name = 'yellow-green'
-  else if (hue < 165) name = 'green'
-  else if (hue < 200) name = 'teal'
-  else if (hue < 250) name = 'blue'
-  else if (hue < 295) name = 'purple'
-  else name = 'pink'
-  if (l < 0.32) return `dark ${name}`
-  if (l > 0.75 && s < 0.6) return `light ${name}`
-  return name
 }
 
 function drawBBox(ctx: CanvasRenderingContext2D, t: Track, vw: number, mirrored: boolean) {
@@ -457,7 +470,7 @@ function drawBBox(ctx: CanvasRenderingContext2D, t: Track, vw: number, mirrored:
   ctx.restore()
 }
 
-function drawDescribedLabel(
+function drawIdentityLabel(
   ctx: CanvasRenderingContext2D,
   t: Track,
   displayNum: number,
@@ -469,15 +482,32 @@ function drawDescribedLabel(
   const yTop = Math.max(28, t.bbox.y)
   const color = colorForId(t.id)
   const title = `#${displayNum}`
-  const desc = t.description || '…'
+
+  // 매칭 결과 줄들 구성
+  const lines: string[] = []
+  if (t.matches.length === 0) {
+    lines.push(t.lastFaceProcessedAt === 0 ? '…' : 'No match')
+  } else {
+    const top = t.matches[0]
+    const second = t.matches[1]
+    const topPct = (top.similarity * 100).toFixed(0)
+    const ambiguous = second && (top.similarity - second.similarity) < 0.10
+    if (ambiguous) {
+      lines.push(`${top.name} (${topPct}%)`)
+      lines.push(`or ${second.name} (${(second.similarity * 100).toFixed(0)}%)`)
+    } else {
+      lines.push(`${top.name} (${topPct}%)`)
+    }
+  }
 
   ctx.save()
   ctx.font = 'bold 16px ui-monospace, Menlo, monospace'
   const titleW = ctx.measureText(title).width
   ctx.font = '14px ui-sans-serif, system-ui, sans-serif'
-  const descW = ctx.measureText(desc).width
-  const boxW = Math.max(titleW, descW) + 22
-  const boxH = 46
+  const maxLineW = Math.max(...lines.map((s) => ctx.measureText(s).width))
+  const boxW = Math.max(titleW, maxLineW) + 22
+  const lineH = 18
+  const boxH = 14 + 18 + lines.length * lineH + 8
 
   let bx = cx - boxW / 2
   let by = yTop - boxH - 8
@@ -497,7 +527,11 @@ function drawDescribedLabel(
   ctx.fillText(title, bx + 10, by + 7)
   ctx.font = '14px ui-sans-serif, system-ui, sans-serif'
   ctx.fillStyle = '#eee'
-  ctx.fillText(desc, bx + 10, by + 26)
+  let lineY = by + 26
+  for (const line of lines) {
+    ctx.fillText(line, bx + 10, lineY)
+    lineY += lineH
+  }
   ctx.restore()
 }
 
@@ -685,8 +719,8 @@ function floodFillFromSeeds(mask: Uint8Array, w: number, h: number, seedIndices:
   return out
 }
 
-function StatusOverlay(props: { status: Status; errorMsg: string; fps: number; trackCount: number }) {
-  const { status, errorMsg, fps, trackCount } = props
+function StatusOverlay(props: { status: Status; errorMsg: string; fps: number; trackCount: number; faceReady: boolean }) {
+  const { status, errorMsg, fps, trackCount, faceReady } = props
   const label: Record<Status, string> = {
     idle: 'idle',
     'loading-model': 'loading model',
@@ -704,6 +738,8 @@ function StatusOverlay(props: { status: Status; errorMsg: string; fps: number; t
           <span style={{ color: fpsColor }}>{fps} fps</span>
           <span style={{ opacity: 0.4 }}>·</span>
           <span>{trackCount} tracked</span>
+          <span style={{ opacity: 0.4 }}>·</span>
+          <span style={{ color: faceReady ? '#7ee' : '#ff7' }}>face {faceReady ? 'ready' : 'loading'}</span>
         </>
       )}
       {status === 'error' && <span style={{ color: '#f77', marginLeft: 6 }}>{errorMsg}</span>}
@@ -871,6 +907,15 @@ const fabStyle = (open: boolean): React.CSSProperties => ({
   display: 'flex', alignItems: 'center', justifyContent: 'center',
   boxShadow: open ? '0 0 16px rgba(126,238,238,0.5)' : '0 2px 8px rgba(0,0,0,0.5)',
 })
+const enrollLinkStyle: React.CSSProperties = {
+  position: 'fixed', top: 12, right: 14, zIndex: 11,
+  color: '#fff', textDecoration: 'none', fontSize: 13,
+  background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(8px)',
+  border: '1px solid rgba(255,255,255,0.35)', borderRadius: 6,
+  padding: '6px 12px',
+  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+  textShadow: '0 1px 2px rgba(0,0,0,0.85)',
+}
 const fsBtnStyle: React.CSSProperties = {
   position: 'fixed', right: 16, bottom: 16, zIndex: 11,
   width: 42, height: 42, borderRadius: '50%',
