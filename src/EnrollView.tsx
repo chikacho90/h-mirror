@@ -2,6 +2,17 @@ import { useEffect, useRef, useState } from 'react'
 import { extractSingleEmbedding, loadFaceModels } from './lib/faceApi'
 import { deleteEmployee, insertEmployee, listEmployees, type Employee } from './lib/supabase'
 
+type BulkProgress = {
+  total: number
+  done: number
+  succeeded: number
+  noFace: number
+  skipped: number
+  failed: number
+  current: string
+  log: string[]    // 최근 처리 결과 (최대 200줄)
+}
+
 export function EnrollView() {
   const [name, setName] = useState('')
   const [employees, setEmployees] = useState<Employee[]>([])
@@ -9,7 +20,11 @@ export function EnrollView() {
   const [busy, setBusy] = useState(false)
   const [message, setMessage] = useState<{ text: string; ok: boolean } | null>(null)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [bulkProgress, setBulkProgress] = useState<BulkProgress | null>(null)
+  const [bulkRunning, setBulkRunning] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const bulkInputRef = useRef<HTMLInputElement>(null)
+  const cancelBulkRef = useRef(false)
 
   useEffect(() => {
     loadFaceModels().then(() => setLoadingModels(false)).catch((e) => {
@@ -55,6 +70,86 @@ export function EnrollView() {
     }
   }
 
+  async function handleBulkFiles(files: FileList) {
+    if (bulkRunning) return
+    cancelBulkRef.current = false
+    setBulkRunning(true)
+    setMessage(null)
+
+    // 이미지 파일만 필터
+    const imageFiles: File[] = []
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i]
+      if (/\.(jpe?g|png)$/i.test(f.name)) imageFiles.push(f)
+    }
+
+    const progress: BulkProgress = {
+      total: imageFiles.length,
+      done: 0,
+      succeeded: 0,
+      noFace: 0,
+      skipped: 0,
+      failed: 0,
+      current: '',
+      log: [],
+    }
+    setBulkProgress({ ...progress })
+
+    function pushLog(line: string) {
+      progress.log.unshift(line)
+      if (progress.log.length > 200) progress.log.length = 200
+    }
+
+    for (const file of imageFiles) {
+      if (cancelBulkRef.current) break
+      const relPath = (file as File & { webkitRelativePath?: string }).webkitRelativePath || file.name
+      progress.current = relPath
+      progress.done++
+      setBulkProgress({ ...progress })
+
+      // 이름 추출: 파일명에서 한글 2-4자 우선, 실패 시 부모 폴더에서
+      const personName = extractPersonName(file.name) || extractPersonName(parentName(relPath))
+      if (!personName) {
+        progress.skipped++
+        pushLog(`⊘ skip (no name): ${relPath}`)
+        continue
+      }
+
+      let url: string | null = null
+      try {
+        url = URL.createObjectURL(file)
+        const img = await loadImage(url)
+        const result = await extractSingleEmbedding(img)
+        if (!result) {
+          progress.noFace++
+          pushLog(`✗ no face: ${personName} ← ${relPath}`)
+          continue
+        }
+        await insertEmployee(personName, Array.from(result.descriptor), relPath)
+        progress.succeeded++
+        pushLog(`✓ ${personName} ← ${relPath}`)
+      } catch (e) {
+        progress.failed++
+        pushLog(`✗ error: ${personName} ← ${relPath}: ${e instanceof Error ? e.message : String(e)}`)
+      } finally {
+        if (url) URL.revokeObjectURL(url)
+      }
+
+      // UI 업데이트 (배치)
+      if (progress.done % 5 === 0 || progress.done === imageFiles.length) {
+        setBulkProgress({ ...progress })
+        // event loop에 양보 — UI 반응성 유지
+        await new Promise((r) => setTimeout(r, 0))
+      }
+    }
+
+    progress.current = ''
+    setBulkProgress({ ...progress })
+    setBulkRunning(false)
+    if (bulkInputRef.current) bulkInputRef.current.value = ''
+    await refreshList()
+  }
+
   async function handleDelete(id: string, name: string) {
     if (!confirm(`Delete "${name}"?`)) return
     try {
@@ -65,6 +160,9 @@ export function EnrollView() {
     }
   }
 
+  // 같은 이름끼리 묶어서 표시
+  const grouped = groupByName(employees)
+
   return (
     <div style={pageStyle}>
       <div style={headerStyle}>
@@ -73,7 +171,7 @@ export function EnrollView() {
       </div>
 
       <section style={cardStyle}>
-        <h2 style={sectionTitleStyle}>Add a person</h2>
+        <h2 style={sectionTitleStyle}>Add a person (single)</h2>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
           <input
             type="text"
@@ -110,19 +208,63 @@ export function EnrollView() {
       </section>
 
       <section style={cardStyle}>
-        <h2 style={sectionTitleStyle}>Enrolled ({employees.length})</h2>
-        {employees.length === 0 ? (
+        <h2 style={sectionTitleStyle}>Bulk upload (folder)</h2>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div style={mutedStyle}>
+            폴더 통째 선택. 파일명에서 한글 이름 2~4자를 자동 추출 (예: <code>강부민.jpg</code>, <code>김민아_VX.jpg</code>).
+            한 사람당 사진이 여러 장이면 모두 동일 이름으로 등록 → 인식 정확도 ↑
+          </div>
+          <input
+            ref={(el) => {
+              bulkInputRef.current = el
+              if (el) { el.setAttribute('webkitdirectory', ''); el.setAttribute('directory', '') }
+            }}
+            type="file"
+            multiple
+            accept="image/jpeg,image/jpg,image/png"
+            onChange={(e) => {
+              const files = e.target.files
+              if (files && files.length > 0) handleBulkFiles(files)
+            }}
+            disabled={bulkRunning || loadingModels}
+            style={inputStyle}
+          />
+          {bulkRunning && (
+            <button type="button" onClick={() => { cancelBulkRef.current = true }} style={cancelBtnStyle}>
+              Cancel
+            </button>
+          )}
+          {bulkProgress && (
+            <BulkProgressView progress={bulkProgress} running={bulkRunning} />
+          )}
+        </div>
+      </section>
+
+      <section style={cardStyle}>
+        <h2 style={sectionTitleStyle}>Enrolled ({employees.length} embeddings · {grouped.length} people)</h2>
+        {grouped.length === 0 ? (
           <div style={mutedStyle}>No one enrolled yet.</div>
         ) : (
           <ul style={{ listStyle: 'none', padding: 0, margin: 0, display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {employees.map((e) => (
-              <li key={e.id} style={rowStyle}>
+            {grouped.map((g) => (
+              <li key={g.name} style={rowStyle}>
                 <div style={{ flex: 1 }}>
-                  <div style={{ fontWeight: 600 }}>{e.name}</div>
-                  <div style={mutedStyle}>{new Date(e.created_at).toLocaleString()}</div>
+                  <div style={{ fontWeight: 600 }}>{g.name}</div>
+                  <div style={mutedStyle}>
+                    {g.items.length} photo{g.items.length === 1 ? '' : 's'}
+                    {' · '}
+                    {new Date(g.items[0].created_at).toLocaleString()}
+                  </div>
                 </div>
-                <button type="button" onClick={() => handleDelete(e.id, e.name)} style={deleteBtnStyle}>
-                  Delete
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!confirm(`Delete all ${g.items.length} embedding(s) for "${g.name}"?`)) return
+                    for (const item of g.items) await handleDelete(item.id, g.name)
+                  }}
+                  style={deleteBtnStyle}
+                >
+                  Delete all
                 </button>
               </li>
             ))}
@@ -135,6 +277,78 @@ export function EnrollView() {
       </p>
     </div>
   )
+}
+
+function BulkProgressView({ progress, running }: { progress: BulkProgress; running: boolean }) {
+  const pct = progress.total > 0 ? (progress.done / progress.total) * 100 : 0
+  return (
+    <div style={{ marginTop: 6 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 6 }}>
+        <div style={{ flex: 1, height: 8, background: 'rgba(255,255,255,0.08)', borderRadius: 4, overflow: 'hidden' }}>
+          <div style={{ width: `${pct}%`, height: '100%', background: running ? '#7ee' : 'rgba(126,238,238,0.5)' }} />
+        </div>
+        <span style={{ fontSize: 13, minWidth: 90, textAlign: 'right' }}>{progress.done}/{progress.total}</span>
+      </div>
+      <div style={{ fontSize: 12, display: 'flex', gap: 12, opacity: 0.8 }}>
+        <span style={{ color: '#7ee' }}>✓ {progress.succeeded}</span>
+        <span style={{ color: '#ff7' }}>∅ no face: {progress.noFace}</span>
+        <span style={{ opacity: 0.6 }}>⊘ skipped: {progress.skipped}</span>
+        <span style={{ color: '#f77' }}>✗ failed: {progress.failed}</span>
+      </div>
+      {progress.current && (
+        <div style={{ fontSize: 12, marginTop: 6, opacity: 0.7 }}>처리 중: {progress.current}</div>
+      )}
+      <details style={{ marginTop: 8 }}>
+        <summary style={{ fontSize: 12, opacity: 0.6, cursor: 'pointer' }}>Log (최근 {progress.log.length}건)</summary>
+        <div style={{
+          marginTop: 6, maxHeight: 220, overflow: 'auto',
+          background: 'rgba(0,0,0,0.4)', border: '1px solid rgba(255,255,255,0.1)',
+          borderRadius: 4, padding: 8, fontSize: 11, fontFamily: 'ui-monospace, monospace',
+        }}>
+          {progress.log.map((line, i) => (
+            <div key={i} style={{ whiteSpace: 'pre', opacity: line.startsWith('✓') ? 0.9 : 0.7 }}>{line}</div>
+          ))}
+        </div>
+      </details>
+    </div>
+  )
+}
+
+function extractPersonName(s: string): string | null {
+  // 확장자 제거
+  const noExt = s.replace(/\.[^.]+$/, '')
+  // 한글 2-4자 첫 단어
+  const m = noExt.match(/[가-힣]{2,4}/)
+  if (!m) return null
+  // 흔한 가짜 매칭 제외
+  const candidate = m[0]
+  const BANNED = new Set([
+    '정방형', '이름', '없음', '폴더', '사진', '프로필', '편집', '원본',
+    '최종', '수정', '파일',
+  ])
+  if (BANNED.has(candidate)) return null
+  return candidate
+}
+
+function parentName(relPath: string): string {
+  const parts = relPath.split('/')
+  if (parts.length < 2) return ''
+  return parts[parts.length - 2] // 부모 폴더명
+}
+
+function groupByName(employees: Employee[]): Array<{ name: string; items: Employee[] }> {
+  const map = new Map<string, Employee[]>()
+  for (const e of employees) {
+    const list = map.get(e.name) || []
+    list.push(e)
+    map.set(e.name, list)
+  }
+  return Array.from(map.entries())
+    .map(([name, items]) => ({
+      name,
+      items: items.sort((a, b) => (a.created_at < b.created_at ? 1 : -1)),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name))
 }
 
 async function loadImage(url: string): Promise<HTMLImageElement> {
@@ -183,4 +397,9 @@ const rowStyle: React.CSSProperties = {
 const deleteBtnStyle: React.CSSProperties = {
   background: 'rgba(255,80,80,0.15)', border: '1px solid rgba(255,80,80,0.5)',
   color: '#f77', padding: '4px 10px', borderRadius: 4, cursor: 'pointer', fontSize: 12,
+}
+const cancelBtnStyle: React.CSSProperties = {
+  alignSelf: 'flex-start',
+  background: 'rgba(255,180,80,0.15)', border: '1px solid rgba(255,180,80,0.5)',
+  color: '#fb7', padding: '6px 12px', borderRadius: 4, cursor: 'pointer', fontSize: 13,
 }
