@@ -473,7 +473,7 @@ function drawBBox(ctx: CanvasRenderingContext2D, t: Track, vw: number, mirrored:
 function drawIdentityLabel(
   ctx: CanvasRenderingContext2D,
   t: Track,
-  displayNum: number,
+  _displayNum: number,
   vw: number,
   mirrored: boolean,
 ) {
@@ -481,36 +481,43 @@ function drawIdentityLabel(
   if (mirrored) cx = vw - cx
   const yTop = Math.max(28, t.bbox.y)
   const color = colorForId(t.id)
-  const title = `#${displayNum}`
 
-  // 매칭 결과 줄들 구성
+  // 매칭 결과 줄들 구성 — 넘버 제거, 이름만 (또는 검색/없음)
   const lines: string[] = []
   if (t.matches.length === 0) {
-    lines.push(t.lastFaceProcessedAt === 0 ? '…' : 'No match')
+    lines.push(t.lastFaceProcessedAt === 0 ? 'Searching…' : 'Unknown')
   } else {
     const top = t.matches[0]
     const second = t.matches[1]
     const topPct = (top.similarity * 100).toFixed(0)
     const ambiguous = second && (top.similarity - second.similarity) < 0.10
+    lines.push(`${top.name} (${topPct}%)`)
     if (ambiguous) {
-      lines.push(`${top.name} (${topPct}%)`)
       lines.push(`or ${second.name} (${(second.similarity * 100).toFixed(0)}%)`)
-    } else {
-      lines.push(`${top.name} (${topPct}%)`)
     }
   }
 
   ctx.save()
-  ctx.font = 'bold 16px ui-monospace, Menlo, monospace'
-  const titleW = ctx.measureText(title).width
+  ctx.font = 'bold 20px ui-sans-serif, system-ui, sans-serif'
+  const headFont = ctx.font
   ctx.font = '14px ui-sans-serif, system-ui, sans-serif'
-  const maxLineW = Math.max(...lines.map((s) => ctx.measureText(s).width))
-  const boxW = Math.max(titleW, maxLineW) + 22
-  const lineH = 18
-  const boxH = 14 + 18 + lines.length * lineH + 8
+  const subFont = ctx.font
+
+  // 첫 줄: 크게 / 두 번째 줄: 작게
+  ctx.font = headFont
+  const headW = ctx.measureText(lines[0]).width
+  ctx.font = subFont
+  const subW = lines[1] ? ctx.measureText(lines[1]).width : 0
+  const padX = 14
+  const padY = 8
+  const headH = 26
+  const subH = lines[1] ? 18 : 0
+  const gap = lines[1] ? 2 : 0
+  const boxW = Math.max(headW, subW) + padX * 2
+  const boxH = padY + headH + gap + subH + padY
 
   let bx = cx - boxW / 2
-  let by = yTop - boxH - 8
+  let by = yTop - boxH - 10
   if (by < 6) by = t.bbox.y + t.bbox.h + 6
   if (bx < 6) bx = 6
   if (bx + boxW > vw - 6) bx = vw - boxW - 6
@@ -522,15 +529,15 @@ function drawIdentityLabel(
   ctx.strokeRect(bx, by, boxW, boxH)
 
   ctx.textBaseline = 'top'
-  ctx.font = 'bold 16px ui-monospace, Menlo, monospace'
-  ctx.fillStyle = color
-  ctx.fillText(title, bx + 10, by + 7)
-  ctx.font = '14px ui-sans-serif, system-ui, sans-serif'
-  ctx.fillStyle = '#eee'
-  let lineY = by + 26
-  for (const line of lines) {
-    ctx.fillText(line, bx + 10, lineY)
-    lineY += lineH
+  // head line
+  ctx.font = headFont
+  ctx.fillStyle = '#fff'
+  ctx.fillText(lines[0], bx + padX, by + padY)
+  // sub line
+  if (lines[1]) {
+    ctx.font = subFont
+    ctx.fillStyle = '#aaa'
+    ctx.fillText(lines[1], bx + padX, by + padY + headH + gap)
   }
   ctx.restore()
 }
