@@ -126,10 +126,10 @@ export async function listEmployeeNames(): Promise<string[]> {
   return Array.from(set).sort()
 }
 
-export async function insertEmployee(name: string, embedding: number[], notes?: string) {
+export async function insertEmployee(name: string, embedding: number[], notes?: string, image_data?: string) {
   const { error } = await supabase
     .from('employees')
-    .insert({ name, embedding, notes: notes ?? null })
+    .insert({ name, embedding, notes: notes ?? null, image_data: image_data ?? null })
   if (error) throw error
 }
 

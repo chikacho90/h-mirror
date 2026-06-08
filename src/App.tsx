@@ -438,7 +438,12 @@ function RecognizeView() {
           onCancel={() => setCaptureModal(null)}
           onSave={async (assignments) => {
             for (const a of assignments) {
-              await insertEmployee(a.name, Array.from(a.descriptor), `webcam-${new Date().toISOString()}`)
+              await insertEmployee(
+                a.name,
+                Array.from(a.descriptor),
+                `webcam-${new Date().toISOString()}`,
+                a.image_data,
+              )
             }
             setCaptureModal(null)
           }}
@@ -623,6 +628,32 @@ async function processFaceMatching(
       }).then(() => autoCfg.onCaptured()).catch(() => { /* skip */ })
     }
   }
+}
+
+function loadImageFromDataUrl(dataUrl: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image()
+    img.onload = () => resolve(img)
+    img.onerror = reject
+    img.src = dataUrl
+  })
+}
+
+function cropFromImage(img: HTMLImageElement, box: { x: number; y: number; width: number; height: number }): string {
+  const SIZE = 200
+  const PAD = 0.25
+  const padW = box.width * PAD
+  const padH = box.height * PAD
+  const sx = Math.max(0, box.x - padW)
+  const sy = Math.max(0, box.y - padH)
+  const sw = Math.min(img.width - sx, box.width + padW * 2)
+  const sh = Math.min(img.height - sy, box.height + padH * 2)
+  const canvas = document.createElement('canvas')
+  canvas.width = SIZE
+  canvas.height = SIZE
+  const ctx = canvas.getContext('2d')!
+  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, SIZE, SIZE)
+  return canvas.toDataURL('image/jpeg', 0.78)
 }
 
 function cropFaceThumb(video: HTMLVideoElement, box: { x: number; y: number; width: number; height: number }): string {
@@ -1014,7 +1045,7 @@ type CaptureModalState = {
 function CaptureTagModal(props: {
   state: CaptureModalState
   onCancel: () => void
-  onSave: (assignments: Array<{ name: string; descriptor: Float32Array }>) => Promise<void>
+  onSave: (assignments: Array<{ name: string; descriptor: Float32Array; image_data: string }>) => Promise<void>
 }) {
   const { state, onCancel, onSave } = props
   const [faces, setFaces] = useState<CaptureFaceState[]>(state.faces)
@@ -1030,7 +1061,14 @@ function CaptureTagModal(props: {
     if (validAssignments.length === 0) return
     setSaving(true)
     try {
-      await onSave(validAssignments.map((f) => ({ name: f.assignment.name.trim(), descriptor: f.descriptor })))
+      // 저장 시 각 얼굴을 캡쳐 이미지에서 잘라 200x200 썸네일로 같이 저장
+      const sourceImg = await loadImageFromDataUrl(state.imageDataUrl)
+      const payload = validAssignments.map((f) => ({
+        name: f.assignment.name.trim(),
+        descriptor: f.descriptor,
+        image_data: cropFromImage(sourceImg, f.box),
+      }))
+      await onSave(payload)
     } catch (e) {
       alert(`Save failed: ${e instanceof Error ? e.message : String(e)}`)
     } finally {
