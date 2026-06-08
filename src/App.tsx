@@ -6,7 +6,7 @@ import {
   type ObjectDetectorResult,
   type ImageSegmenterResult,
 } from '@mediapipe/tasks-vision'
-import { EnrollView } from './EnrollView'
+import { AdminView } from './AdminView'
 import { extractAllEmbeddings, loadFaceModels } from './lib/faceApi'
 import { insertEmployee, listEmployeeNames, matchFace, type MatchResult } from './lib/supabase'
 
@@ -50,17 +50,17 @@ type Track = {
 }
 
 export default function App() {
-  const [view, setView] = useState<'recognize' | 'enroll'>(
-    typeof window !== 'undefined' && window.location.hash === '#enroll' ? 'enroll' : 'recognize'
+  const [view, setView] = useState<'recognize' | 'admin'>(
+    typeof window !== 'undefined' && window.location.hash === '#admin' ? 'admin' : 'recognize'
   )
   useEffect(() => {
     function onHash() {
-      setView(window.location.hash === '#enroll' ? 'enroll' : 'recognize')
+      setView(window.location.hash === '#admin' ? 'admin' : 'recognize')
     }
     window.addEventListener('hashchange', onHash)
     return () => window.removeEventListener('hashchange', onHash)
   }, [])
-  if (view === 'enroll') return <EnrollView />
+  if (view === 'admin') return <AdminView />
   return <RecognizeView />
 }
 
@@ -351,8 +351,7 @@ function RecognizeView() {
         <StatusOverlay status={status} errorMsg={errorMsg} fps={fps} trackCount={trackCount} faceReady={faceReady} />
       )}
 
-      {/* 우상단 Enroll 링크 — 등록 화면으로 */}
-      <a href="#enroll" style={enrollLinkStyle}>Enroll →</a>
+      {/* Enroll 링크 제거됨 — 관리 페이지는 #admin 으로 URL 직접 입력해서 진입 */}
 
       <BottomPanel
         open={panelOpen}
@@ -1175,15 +1174,6 @@ const fabStyle = (open: boolean): React.CSSProperties => ({
   display: 'flex', alignItems: 'center', justifyContent: 'center',
   boxShadow: open ? '0 0 16px rgba(126,238,238,0.5)' : '0 2px 8px rgba(0,0,0,0.5)',
 })
-const enrollLinkStyle: React.CSSProperties = {
-  position: 'fixed', top: 12, right: 14, zIndex: 11,
-  color: '#fff', textDecoration: 'none', fontSize: 13,
-  background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(8px)',
-  border: '1px solid rgba(255,255,255,0.35)', borderRadius: 6,
-  padding: '6px 12px',
-  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-  textShadow: '0 1px 2px rgba(0,0,0,0.85)',
-}
 const modalBackdropStyle: React.CSSProperties = {
   position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 100,
   display: 'flex', alignItems: 'center', justifyContent: 'center',
