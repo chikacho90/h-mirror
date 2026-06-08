@@ -25,8 +25,9 @@ const MASK_REFRESH_MS = 60
 const OBJECT_REFRESH_MS = 25
 const FPS_UPDATE_MS = 500
 const FACE_REFRESH_MS = 700        // 얼굴 검출 + 임베딩 호출 주기 (≈1.4fps — DB 쿼리 부담 줄임)
-const MATCH_THRESHOLD = 0.3        // pgvector cosine similarity 컷오프
-const MATCH_TOP_K = 3
+const MATCH_THRESHOLD = 0.2        // pgvector cosine similarity 컷오프 (낮춰서 2-3위 후보도 잡힘)
+const MATCH_TOP_K = 20             // dedupe 후 unique 이름 3개 뽑으려면 raw 매칭 여러 개 필요
+const DISPLAY_TOP_N = 3            // 라벨에 표시할 unique 이름 개수
 
 type Status = 'idle' | 'loading-model' | 'requesting-camera' | 'running' | 'error'
 type BBox = { x: number; y: number; w: number; h: number }
@@ -569,24 +570,11 @@ function drawIdentityLabel(
   const yTop = Math.max(28, t.bbox.y)
   const color = colorForId(t.id)
 
-  // 매칭 결과 줄들 구성 — 넘버 제거, 이름만 (또는 검색/없음)
-  // 같은 사람의 다른 임베딩이 top-K에 여러 개 들어올 수 있으므로 이름 기준 dedupe
-  const lines: string[] = []
-  if (t.matches.length === 0) {
-    lines.push(t.lastFaceProcessedAt === 0 ? 'Searching…' : 'Unknown')
-  } else {
-    const dedup: { name: string; similarity: number }[] = []
-    for (const m of t.matches) {
-      if (!dedup.find((d) => d.name === m.name)) dedup.push(m)
-    }
-    const top = dedup[0]
-    const second = dedup[1]
-    const topPct = (top.similarity * 100).toFixed(0)
-    const ambiguous = second && (top.similarity - second.similarity) < 0.10
-    lines.push(`${top.name} (${topPct}%)`)
-    if (ambiguous) {
-      lines.push(`or ${second.name} (${(second.similarity * 100).toFixed(0)}%)`)
-    }
+  // 매칭 결과 — 이름 기준 dedupe 후 unique top-N 추출
+  const dedup: { name: string; similarity: number }[] = []
+  for (const m of t.matches) {
+    if (!dedup.find((d) => d.name === m.name)) dedup.push(m)
+    if (dedup.length >= DISPLAY_TOP_N) break
   }
 
   ctx.save()
@@ -595,18 +583,23 @@ function drawIdentityLabel(
   ctx.font = '14px ui-sans-serif, system-ui, sans-serif'
   const subFont = ctx.font
 
-  // 첫 줄: 크게 / 두 번째 줄: 작게
+  const headLine = dedup.length > 0
+    ? `${dedup[0].name} (${(dedup[0].similarity * 100).toFixed(0)}%)`
+    : (t.lastFaceProcessedAt === 0 ? 'Searching…' : 'Unknown')
+  const subLines = dedup.slice(1).map((d) => `${d.name} (${(d.similarity * 100).toFixed(0)}%)`)
+
   ctx.font = headFont
-  const headW = ctx.measureText(lines[0]).width
+  const headW = ctx.measureText(headLine).width
   ctx.font = subFont
-  const subW = lines[1] ? ctx.measureText(lines[1]).width : 0
+  const subW = Math.max(0, ...subLines.map((s) => ctx.measureText(s).width))
+
   const padX = 14
   const padY = 8
   const headH = 26
-  const subH = lines[1] ? 18 : 0
-  const gap = lines[1] ? 2 : 0
+  const subH = 18
+  const gap = subLines.length > 0 ? 4 : 0
   const boxW = Math.max(headW, subW) + padX * 2
-  const boxH = padY + headH + gap + subH + padY
+  const boxH = padY + headH + gap + subLines.length * subH + padY
 
   let bx = cx - boxW / 2
   let by = yTop - boxH - 10
@@ -621,15 +614,15 @@ function drawIdentityLabel(
   ctx.strokeRect(bx, by, boxW, boxH)
 
   ctx.textBaseline = 'top'
-  // head line
   ctx.font = headFont
   ctx.fillStyle = '#fff'
-  ctx.fillText(lines[0], bx + padX, by + padY)
-  // sub line
-  if (lines[1]) {
-    ctx.font = subFont
-    ctx.fillStyle = '#aaa'
-    ctx.fillText(lines[1], bx + padX, by + padY + headH + gap)
+  ctx.fillText(headLine, bx + padX, by + padY)
+  ctx.font = subFont
+  ctx.fillStyle = '#aaa'
+  let lineY = by + padY + headH + gap
+  for (const s of subLines) {
+    ctx.fillText(s, bx + padX, lineY)
+    lineY += subH
   }
   ctx.restore()
 }
