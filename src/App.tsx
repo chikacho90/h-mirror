@@ -7,8 +7,12 @@ import {
   type ImageSegmenterResult,
 } from '@mediapipe/tasks-vision'
 import { AdminView } from './AdminView'
+import { ReviewModal } from './ReviewModal'
 import { extractAllEmbeddings, loadFaceModels } from './lib/faceApi'
-import { insertEmployee, listEmployeeNames, matchFace, type MatchResult } from './lib/supabase'
+import {
+  countPendingCaptures, insertEmployee, insertPendingCapture,
+  listEmployeeNames, matchFace, type MatchResult,
+} from './lib/supabase'
 
 const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm'
 const OBJ_MODEL = 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite'
@@ -30,6 +34,11 @@ const FACE_REFRESH_MS = 700        // 얼굴 검출 + 임베딩 호출 주기 (�
 const MATCH_THRESHOLD = 0.0        // 임계 0 — top-4 표시용이라 낮은 후보도 받음 (의미 없으면 row 자체가 없음)
 const MATCH_TOP_K = 30             // dedupe 후 unique 4명 확보용
 const DISPLAY_TOP_N = 4            // 1+3 (큰 + 작은 inline)
+// 자동 캡쳐 — 메인페이지에 지나가는 사람들을 모아서 review 풀에 쌓아둠
+const AUTO_CAPTURE_MIN_TRACK_AGE_MS = 1500   // 트랙이 안정될 때까지 기다림
+const AUTO_CAPTURE_COOLDOWN_MS = 30000       // 같은 트랙은 30초마다 1장만
+const AUTO_CAPTURE_MIN_FACE_PX = 56          // 너무 작은 얼굴 (먼 거리) 스킵
+const PENDING_COUNT_REFRESH_MS = 30000       // 도움 버튼 배지 새로고침
 
 type Status = 'idle' | 'loading-model' | 'requesting-camera' | 'running' | 'error'
 type BBox = { x: number; y: number; w: number; h: number }
@@ -84,6 +93,10 @@ function RecognizeView() {
   const [captureModal, setCaptureModal] = useState<CaptureModalState | null>(null)
   const [capturing, setCapturing] = useState(false)
   const [cameraDeviceId, setCameraDeviceId] = useState<string | null>(null)
+  const [showReview, setShowReview] = useState(false)
+  const [pendingCount, setPendingCount] = useState(0)
+  // 트랙 id 별 마지막 자동 캡쳐 시각 — 같은 사람 spam 방지
+  const autoCaptureCooldownRef = useRef<Map<number, number>>(new Map())
 
   const mirrorRef = useRef(true)
   const refs = {
@@ -129,6 +142,20 @@ function RecognizeView() {
     function onChange() { setIsFullscreen(!!document.fullscreenElement) }
     document.addEventListener('fullscreenchange', onChange)
     return () => document.removeEventListener('fullscreenchange', onChange)
+  }, [])
+
+  // pending capture 개수 주기적 새로고침 (도움 버튼 배지용)
+  useEffect(() => {
+    let cancelled = false
+    async function fetchCount() {
+      try {
+        const c = await countPendingCaptures()
+        if (!cancelled) setPendingCount(c)
+      } catch { /* skip */ }
+    }
+    fetchCount()
+    const id = setInterval(fetchCount, PENDING_COUNT_REFRESH_MS)
+    return () => { cancelled = true; clearInterval(id) }
   }, [])
 
   useEffect(() => {
@@ -325,7 +352,10 @@ function RecognizeView() {
         ts - lastFaceRunAtRef.current >= FACE_REFRESH_MS) {
       lastFaceRunAtRef.current = ts
       faceProcessingRef.current = true
-      processFaceMatching(video, tracksRef.current).finally(() => {
+      processFaceMatching(video, tracksRef.current, {
+        cooldown: autoCaptureCooldownRef.current,
+        onCaptured: () => setPendingCount((c) => c + 1),
+      }).finally(() => {
         faceProcessingRef.current = false
       })
     }
@@ -366,6 +396,28 @@ function RecognizeView() {
       />
 
       {fsUiVisible && (<FullscreenButton isFullscreen={isFullscreen} />)}
+
+      {/* 우하단 도움 버튼 — 자동 캡쳐된 얼굴 분류/확정 모달 열기 */}
+      {fsUiVisible && (
+        <button
+          type="button"
+          onClick={() => setShowReview(true)}
+          title="Help improve recognition"
+          style={helpBtnStyle}
+        >
+          💡
+          {pendingCount > 0 && <span style={helpBadgeStyle}>{pendingCount > 99 ? '99+' : pendingCount}</span>}
+        </button>
+      )}
+
+      {showReview && (
+        <ReviewModal
+          onClose={() => setShowReview(false)}
+          onChange={async () => {
+            try { setPendingCount(await countPendingCaptures()) } catch { /* skip */ }
+          }}
+        />
+      )}
 
       {/* 좌하단 캡쳐 버튼 — 현재 프레임 잡아서 인물 태깅 모달 띄움 */}
       {fsUiVisible && (
@@ -505,7 +557,12 @@ function iouOf(a: BBox, b: BBox): number {
 function lerp(a: number, b: number, t: number): number { return a + (b - a) * t }
 
 // 전체 비디오 프레임에서 얼굴 검출 + 임베딩 → DB 매칭 → 트랙에 결과 캐싱
-async function processFaceMatching(video: HTMLVideoElement, tracks: Track[]) {
+// + 트랙이 안정적이면 자동 캡쳐해서 pending pool에 적재 (review 모달에서 사람 확인)
+async function processFaceMatching(
+  video: HTMLVideoElement,
+  tracks: Track[],
+  autoCfg: { cooldown: Map<number, number>; onCaptured: () => void },
+) {
   const now = performance.now()
 
   // 시도 자체는 매 사이클 기록 — "Searching…"이 영구적이지 않게
@@ -545,7 +602,44 @@ async function processFaceMatching(video: HTMLVideoElement, tracks: Track[]) {
     } catch {
       // skip on transient errors
     }
+
+    // 자동 캡쳐 — 트랙 안정 + cooldown OK + 얼굴 충분히 큰 경우
+    const trackAge = now - best.firstSeenAt
+    const lastCap = autoCfg.cooldown.get(best.id) ?? 0
+    if (
+      trackAge >= AUTO_CAPTURE_MIN_TRACK_AGE_MS &&
+      now - lastCap >= AUTO_CAPTURE_COOLDOWN_MS &&
+      face.box.width >= AUTO_CAPTURE_MIN_FACE_PX
+    ) {
+      autoCfg.cooldown.set(best.id, now)
+      const thumb = cropFaceThumb(video, face.box)
+      const top = best.matches[0]
+      // fire-and-forget — UI를 막지 않도록
+      insertPendingCapture({
+        image_data: thumb,
+        embedding: Array.from(face.descriptor),
+        auto_top_name: top?.name ?? null,
+        auto_top_similarity: top?.similarity ?? null,
+      }).then(() => autoCfg.onCaptured()).catch(() => { /* skip */ })
+    }
   }
+}
+
+function cropFaceThumb(video: HTMLVideoElement, box: { x: number; y: number; width: number; height: number }): string {
+  const SIZE = 200
+  const PAD = 0.25
+  const padW = box.width * PAD
+  const padH = box.height * PAD
+  const sx = Math.max(0, box.x - padW)
+  const sy = Math.max(0, box.y - padH)
+  const sw = Math.min(video.videoWidth - sx, box.width + padW * 2)
+  const sh = Math.min(video.videoHeight - sy, box.height + padH * 2)
+  const canvas = document.createElement('canvas')
+  canvas.width = SIZE
+  canvas.height = SIZE
+  const ctx = canvas.getContext('2d')!
+  ctx.drawImage(video, sx, sy, sw, sh, 0, 0, SIZE, SIZE)
+  return canvas.toDataURL('image/jpeg', 0.78)
 }
 
 function drawBBox(ctx: CanvasRenderingContext2D, t: Track, vw: number, mirrored: boolean) {
@@ -1229,4 +1323,23 @@ const fsBtnStyle: React.CSSProperties = {
   color: '#fff', cursor: 'pointer', padding: 0,
   display: 'flex', alignItems: 'center', justifyContent: 'center',
   boxShadow: '0 2px 8px rgba(0,0,0,0.5)', transition: 'opacity 200ms',
+}
+
+const helpBtnStyle: React.CSSProperties = {
+  position: 'fixed', right: 66, bottom: 16, zIndex: 11,
+  width: 42, height: 42, borderRadius: '50%',
+  border: '1px solid rgba(255,255,255,0.4)',
+  background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(8px)',
+  color: '#fff', cursor: 'pointer', padding: 0,
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+  boxShadow: '0 2px 8px rgba(0,0,0,0.5)', transition: 'opacity 200ms',
+  fontSize: 18,
+}
+const helpBadgeStyle: React.CSSProperties = {
+  position: 'absolute', top: -4, right: -4,
+  minWidth: 18, height: 18, padding: '0 5px', borderRadius: 9,
+  background: '#ff5050', color: '#fff', fontSize: 11, fontWeight: 700,
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+  border: '1px solid rgba(0,0,0,0.4)',
+  fontFamily: 'ui-monospace, monospace',
 }
