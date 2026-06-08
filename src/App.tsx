@@ -892,42 +892,50 @@ function BottomPanel(props: {
   const { open, toggle, shape, target, cameras, cameraDeviceId,
     setShape, setTarget, setCameraDeviceId } = props
   return (
-    <div style={bottomWrapStyle}>
-      {open && (
-        <div style={panelStyle}>
-          {cameras.length > 0 && (
-            <Row label="Camera">
-              {cameras.map((c, i) => (
-                <Toggle
-                  key={c.deviceId || i}
-                  on={cameraDeviceId === c.deviceId || (cameraDeviceId === null && i === 0)}
-                  onClick={() => setCameraDeviceId((prev) => prev === c.deviceId ? null : c.deviceId)}
-                >
-                  {c.label || `Camera ${i + 1}`}
-                </Toggle>
-              ))}
-            </Row>
-          )}
-          {TARGET_OPTIONS.length > 0 && (
-            <Row label="Target">
-              {TARGET_OPTIONS.map((t) => (
-                <Toggle key={t} on={target === t} onClick={() => setTarget((prev) => prev === t ? 'none' : t)}>{targetLabel(t)}</Toggle>
-              ))}
-            </Row>
-          )}
-          {DISPLAY_OPTIONS.length > 0 && (
-            <Row label="Display">
-              {DISPLAY_OPTIONS.map((s) => (
-                <Toggle key={s} on={shape === s} onClick={() => setShape((prev) => prev === s ? 'none' : s)}>{shapeLabel(s)}</Toggle>
-              ))}
-            </Row>
-          )}
-        </div>
-      )}
+    <>
       <button type="button" onClick={toggle} title="Settings" style={fabStyle(open)}>
         <GearIcon />
       </button>
-    </div>
+      {open && (
+        <div style={settingsBackdropStyle} onClick={toggle}>
+          <div style={settingsModalStyle} onClick={(e) => e.stopPropagation()}>
+            <div style={settingsHeaderStyle}>
+              <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700 }}>설정</h2>
+              <button type="button" onClick={toggle} style={settingsCloseStyle} aria-label="Close">✕</button>
+            </div>
+            <div style={settingsBodyStyle}>
+              {cameras.length > 0 && (
+                <Row label="Camera">
+                  {cameras.map((c, i) => (
+                    <Toggle
+                      key={c.deviceId || i}
+                      on={cameraDeviceId === c.deviceId || (cameraDeviceId === null && i === 0)}
+                      onClick={() => setCameraDeviceId((prev) => prev === c.deviceId ? null : c.deviceId)}
+                    >
+                      {c.label || `Camera ${i + 1}`}
+                    </Toggle>
+                  ))}
+                </Row>
+              )}
+              {TARGET_OPTIONS.length > 0 && (
+                <Row label="Target">
+                  {TARGET_OPTIONS.map((t) => (
+                    <Toggle key={t} on={target === t} onClick={() => setTarget((prev) => prev === t ? 'none' : t)}>{targetLabel(t)}</Toggle>
+                  ))}
+                </Row>
+              )}
+              {DISPLAY_OPTIONS.length > 0 && (
+                <Row label="Display">
+                  {DISPLAY_OPTIONS.map((s) => (
+                    <Toggle key={s} on={shape === s} onClick={() => setShape((prev) => prev === s ? 'none' : s)}>{shapeLabel(s)}</Toggle>
+                  ))}
+                </Row>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   )
 }
 
@@ -1003,15 +1011,29 @@ const statusOverlayStyle: React.CSSProperties = {
   color: '#fff', textShadow: '0 1px 3px rgba(0,0,0,0.85)',
   pointerEvents: 'none', maxWidth: 'calc(100vw - 28px)',
 }
-const bottomWrapStyle: React.CSSProperties = {
-  display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 10,
-  maxWidth: 'calc(100vw - 32px)',
-  fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-  color: '#fff', textShadow: '0 1px 2px rgba(0,0,0,0.85)',
+const settingsBackdropStyle: React.CSSProperties = {
+  position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 50,
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+  padding: '5vh 5vw',
 }
-const panelStyle: React.CSSProperties = {
-  display: 'flex', flexDirection: 'column', gap: 8,
-  fontSize: 13, maxWidth: 'min(720px, calc(100vw - 28px))', alignItems: 'flex-start',
+const settingsModalStyle: React.CSSProperties = {
+  background: '#13161a', color: '#e8e8e8',
+  borderRadius: 14, padding: 22,
+  width: '100%', maxWidth: 640,
+  border: '1px solid rgba(255,255,255,0.1)',
+  maxHeight: 'calc(100vh - 80px)', overflow: 'auto',
+  fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+}
+const settingsHeaderStyle: React.CSSProperties = {
+  display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+  marginBottom: 16,
+}
+const settingsCloseStyle: React.CSSProperties = {
+  background: 'transparent', border: 'none', color: '#aaa',
+  cursor: 'pointer', fontSize: 22, padding: 6,
+}
+const settingsBodyStyle: React.CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: 14,
 }
 const rowStyle: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap',
