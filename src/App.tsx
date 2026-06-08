@@ -8,7 +8,7 @@ import {
 } from '@mediapipe/tasks-vision'
 import { AdminView } from './AdminView'
 import { ShutterModal, type ShutterShotState } from './ShutterModal'
-import { extractAllEmbeddings, loadFaceModels } from './lib/faceApi'
+import { extractSingleEmbedding, loadFaceModels } from './lib/faceApi'
 import { autoCapture, matchFace, type MatchResult } from './lib/supabase'
 
 const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm'
@@ -489,67 +489,76 @@ function iouOf(a: BBox, b: BBox): number {
 
 function lerp(a: number, b: number, t: number): number { return a + (b - a) * t }
 
-// 전체 비디오 프레임에서 얼굴 검출 + 임베딩 → DB 매칭 → 트랙에 결과 캐싱
-// + 트랙이 안정적이면 자동 캡쳐해서 pending pool에 적재 (review 모달에서 사람 확인)
+// 트랙별 crop 기반 얼굴 검출 — 사람마다 자기 영역만 잘라서 face-api에 넣음
+// 작은 얼굴도 입력의 큰 비중을 차지해서 인식률↑. 트랙-얼굴 매칭 휴리스틱도 불필요.
 async function processFaceMatching(
   video: HTMLVideoElement,
   tracks: Track[],
   autoCfg: { cooldown: Map<number, number> },
 ) {
   const now = performance.now()
-
   // 시도 자체는 매 사이클 기록 — "Searching…"이 영구적이지 않게
   for (const t of tracks) {
     if (t.lastFaceProcessedAt === 0) t.lastFaceProcessedAt = now
   }
 
-  let faces: Awaited<ReturnType<typeof extractAllEmbeddings>>
-  try {
-    faces = await extractAllEmbeddings(video)
-  } catch {
-    return
-  }
-  if (faces.length === 0) return
+  const tmpCanvas = document.createElement('canvas')
+  const tmpCtx = tmpCanvas.getContext('2d')
+  if (!tmpCtx) return
 
-  // 각 face의 중심을 가장 가까운 트랙의 head 영역(상단 35%)에 매칭
-  for (const face of faces) {
-    const fcx = face.box.x + face.box.width / 2
-    const fcy = face.box.y + face.box.height / 2
-    let best: Track | null = null
-    let bestDist = Infinity
-    for (const t of tracks) {
-      const headCx = t.bbox.x + t.bbox.w / 2
-      const headCy = t.bbox.y + Math.min(t.bbox.h * 0.25, face.box.height * 0.8)
-      const d = Math.hypot(fcx - headCx, fcy - headCy)
-      const inside = fcx >= t.bbox.x && fcx <= t.bbox.x + t.bbox.w &&
-                     fcy >= t.bbox.y && fcy <= t.bbox.y + t.bbox.h * 0.6
-      const dScore = inside ? d * 0.5 : d
-      if (dScore < bestDist) { bestDist = dScore; best = t }
+  for (const track of tracks) {
+    // 트랙 영역 + 15% 패딩으로 crop. (target=face면 이미 face-shaped, full-body면 상단에 얼굴)
+    const PAD_FRAC = 0.15
+    const padX = track.bbox.w * PAD_FRAC
+    const padY = track.bbox.h * PAD_FRAC
+    const sx = Math.max(0, track.bbox.x - padX)
+    const sy = Math.max(0, track.bbox.y - padY)
+    const sw = Math.min(video.videoWidth - sx, track.bbox.w + padX * 2)
+    const sh = Math.min(video.videoHeight - sy, track.bbox.h + padY * 2)
+    if (sw < 30 || sh < 30) continue
+
+    tmpCanvas.width = Math.round(sw)
+    tmpCanvas.height = Math.round(sh)
+    tmpCtx.drawImage(video, sx, sy, sw, sh, 0, 0, tmpCanvas.width, tmpCanvas.height)
+
+    let detection: Awaited<ReturnType<typeof extractSingleEmbedding>>
+    try {
+      detection = await extractSingleEmbedding(tmpCanvas)
+    } catch {
+      continue
     }
-    if (!best) continue
+    if (!detection) continue
+
+    // detection.box 좌표를 video 원본 좌표로 환산
+    const originalBox = {
+      x: sx + detection.box.x,
+      y: sy + detection.box.y,
+      width: detection.box.width,
+      height: detection.box.height,
+    }
 
     try {
-      const results = await matchFace(Array.from(face.descriptor), MATCH_TOP_K, MATCH_THRESHOLD)
-      best.matches = results
-      best.lastFaceProcessedAt = performance.now()
+      const results = await matchFace(Array.from(detection.descriptor), MATCH_TOP_K, MATCH_THRESHOLD)
+      track.matches = results
+      track.lastFaceProcessedAt = performance.now()
     } catch {
       // skip on transient errors
     }
 
     // 자동 캡쳐 — 트랙 안정 + cooldown OK + 얼굴 충분히 큰 경우
-    const trackAge = now - best.firstSeenAt
-    const lastCap = autoCfg.cooldown.get(best.id) ?? 0
+    const trackAge = now - track.firstSeenAt
+    const lastCap = autoCfg.cooldown.get(track.id) ?? 0
     if (
       trackAge >= AUTO_CAPTURE_MIN_TRACK_AGE_MS &&
       now - lastCap >= AUTO_CAPTURE_COOLDOWN_MS &&
-      face.box.width >= AUTO_CAPTURE_MIN_FACE_PX
+      originalBox.width >= AUTO_CAPTURE_MIN_FACE_PX
     ) {
-      autoCfg.cooldown.set(best.id, now)
-      const thumb = cropFaceThumb(video, face.box)
-      const top = best.matches[0]
+      autoCfg.cooldown.set(track.id, now)
+      const thumb = cropFaceThumb(video, originalBox)
+      const top = track.matches[0]
       // fire-and-forget — UI 안 막음. autoCapture가 신뢰도 보고 직접추가/pending 분기
       autoCapture({
-        embedding: Array.from(face.descriptor),
+        embedding: Array.from(detection.descriptor),
         image_data: thumb,
         topMatch: top ? { name: top.name, similarity: top.similarity } : null,
         highConfThreshold: AUTO_CAPTURE_HIGH_CONF,
