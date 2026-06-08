@@ -25,9 +25,10 @@ const MASK_REFRESH_MS = 60
 const OBJECT_REFRESH_MS = 25
 const FPS_UPDATE_MS = 500
 const FACE_REFRESH_MS = 700        // 얼굴 검출 + 임베딩 호출 주기 (≈1.4fps — DB 쿼리 부담 줄임)
-const MATCH_THRESHOLD = 0.2        // pgvector cosine similarity 컷오프 (낮춰서 2-3위 후보도 잡힘)
-const MATCH_TOP_K = 20             // dedupe 후 unique 이름 3개 뽑으려면 raw 매칭 여러 개 필요
-const DISPLAY_TOP_N = 3            // 라벨에 표시할 unique 이름 개수
+// 이제 RPC가 Euclidean 거리 기반 (face-api 표준). 같은 사람 80-100%, 닮은 60-80%, 다른 50% 이하
+const MATCH_THRESHOLD = 0.4        // similarity 임계 (distance ≤ 0.6 ~ face-api 표준)
+const MATCH_TOP_K = 20             // dedupe 후 unique 이름 3개 뽑기 위해 raw 매칭 여러 개
+const DISPLAY_TOP_N = 3
 
 type Status = 'idle' | 'loading-model' | 'requesting-camera' | 'running' | 'error'
 type BBox = { x: number; y: number; w: number; h: number }
