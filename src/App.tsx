@@ -28,9 +28,9 @@ const FPS_UPDATE_MS = 500
 const FACE_REFRESH_MS = 700        // 얼굴 검출 + 임베딩 호출 주기 (≈1.4fps — DB 쿼리 부담 줄임)
 // RPC가 Euclidean 거리 기반 (face-api 표준). 같은 사람 80-100%, 닮은 60-80%, 무관 50% 이하
 // similarity = 1 - euclidean_distance (모든 후보에 동일 공식 = 같은 스케일)
-const MATCH_THRESHOLD = 0.0        // 임계 0 — top-N 표시용이라 낮은 후보도 받음
-const MATCH_TOP_K = 30             // dedupe 후 unique 3명 확보용
-const DISPLAY_TOP_N = 3            // 한 줄에 top-3 (1위 강조)
+const MATCH_THRESHOLD = 0.0        // 임계 0 — 매칭 결과 받기만 함
+const MATCH_TOP_K = 10             // top-1만 보여도 dedupe 여유 위해 여러 개 가져옴
+const DISPLAY_TOP_N = 1            // top-1만 표시
 // 자동 캡쳐 — 메인페이지에 지나가는 사람들을 자동 분류 (높음=직접 추가 / 낮음=admin 후보 풀)
 const AUTO_CAPTURE_MIN_TRACK_AGE_MS = 1500   // 트랙이 안정될 때까지 기다림
 const AUTO_CAPTURE_COOLDOWN_MS = 30000       // 같은 트랙은 30초마다 1장만
