@@ -16,6 +16,8 @@ type FaceData = {
   box: { x: number; y: number; width: number; height: number }
   descriptor: Float32Array
   matches: MatchResult[]
+  thumbDataUrl: string
+  savedAs: string | null
 }
 
 const FACE_CROP_SIZE = 200
@@ -25,14 +27,11 @@ export function ShutterModal(props: { shot: ShutterShotState; onClose: () => voi
   const [uploadUrl, setUploadUrl] = useState<string | null>(null)
   const [uploadError, setUploadError] = useState<string | null>(null)
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null)
-  const [primary, setPrimary] = useState<FaceData | null>(null)
-  const [analyzing, setAnalyzing] = useState(true)
-  const [savingName, setSavingName] = useState<string | null>(null)
-  const [savedAs, setSavedAs] = useState<string | null>(null)
-  const [otherInput, setOtherInput] = useState('')
-  const [otherActive, setOtherActive] = useState(false)
+  const [faces, setFaces] = useState<FaceData[]>([])
+  const [analyzing, setAnalyzing] = useState(false)
+  const [helpOpen, setHelpOpen] = useState(false)
 
-  // 업로드 → public URL → QR
+  // QR (always: 업로드 → public URL → QR)
   useEffect(() => {
     let cancelled = false
     ;(async () => {
@@ -50,57 +49,54 @@ export function ShutterModal(props: { shot: ShutterShotState; onClose: () => voi
     return () => { cancelled = true }
   }, [shot])
 
-  // 얼굴 검출 + 가장 큰 얼굴(primary)에 대해 top-3 매칭
+  // help 패널 열릴 때만 얼굴 검출 (불필요한 매칭 회피)
   useEffect(() => {
+    if (!helpOpen || faces.length > 0 || analyzing) return
     let cancelled = false
+    setAnalyzing(true)
     ;(async () => {
       try {
         const img = await loadImage(shot.imageDataUrl)
         if (cancelled) return
-        const faces = await extractAllEmbeddings(img)
+        const detected = await extractAllEmbeddings(img)
         if (cancelled) return
-        if (faces.length === 0) { setPrimary(null); setAnalyzing(false); return }
-        const sorted = [...faces].sort((a, b) => (b.box.width * b.box.height) - (a.box.width * a.box.height))
-        const top = sorted[0]
-        let matches: MatchResult[] = []
-        try { matches = await matchFace(Array.from(top.descriptor), 12, 0.0) } catch { /* skip */ }
-        // 이름 dedupe → top-3
-        const dedup: MatchResult[] = []
-        for (const m of matches) {
-          if (!dedup.find((d) => d.name === m.name)) dedup.push(m)
-          if (dedup.length >= 3) break
+        const sorted = [...detected].sort((a, b) => (b.box.width * b.box.height) - (a.box.width * a.box.height))
+        const result: FaceData[] = []
+        for (const f of sorted) {
+          let matches: MatchResult[] = []
+          try { matches = await matchFace(Array.from(f.descriptor), 15, 0.0) } catch { /* skip */ }
+          const dedup: MatchResult[] = []
+          for (const m of matches) {
+            if (!dedup.find((d) => d.name === m.name)) dedup.push(m)
+            if (dedup.length >= 3) break
+          }
+          const thumbDataUrl = await cropFaceFromImage(img, f.box)
+          result.push({ box: f.box, descriptor: f.descriptor, matches: dedup, thumbDataUrl, savedAs: null })
         }
-        if (!cancelled) {
-          setPrimary({ box: top.box, descriptor: top.descriptor, matches: dedup })
-          setAnalyzing(false)
-        }
+        if (!cancelled) setFaces(result)
       } catch {
+        // skip
+      } finally {
         if (!cancelled) setAnalyzing(false)
       }
     })()
     return () => { cancelled = true }
-  }, [shot])
+  }, [helpOpen, shot, faces.length, analyzing])
 
-  async function handleAssign(name: string) {
-    if (!primary) return
+  async function handleAssign(idx: number, name: string) {
     const trimmed = name.trim()
-    if (!trimmed) return
-    setSavingName(trimmed)
+    const face = faces[idx]
+    if (!trimmed || !face) return
     try {
-      const thumb = cropFaceFromDataUrl(shot.imageDataUrl, primary.box)
-      await thumb.then((dataUrl) =>
-        insertEmployeeWithDiversityCap({
-          name: trimmed,
-          embedding: Array.from(primary.descriptor),
-          image_data: dataUrl,
-          notes: `shutter-${new Date().toISOString()}`,
-        })
-      )
-      setSavedAs(trimmed)
+      await insertEmployeeWithDiversityCap({
+        name: trimmed,
+        embedding: Array.from(face.descriptor),
+        image_data: face.thumbDataUrl,
+        notes: `shutter-${new Date().toISOString()}`,
+      })
+      setFaces((prev) => prev.map((f, i) => i === idx ? { ...f, savedAs: trimmed } : f))
     } catch (e) {
       alert(`Save failed: ${e instanceof Error ? e.message : String(e)}`)
-    } finally {
-      setSavingName(null)
     }
   }
 
@@ -109,92 +105,135 @@ export function ShutterModal(props: { shot: ShutterShotState; onClose: () => voi
       <div style={contentStyle} onClick={(e) => e.stopPropagation()}>
         <button type="button" onClick={onClose} style={closeBtnStyle} aria-label="Close">✕</button>
 
-        <div style={topRowStyle}>
+        <div style={mainAreaStyle}>
           <div style={previewWrapStyle}>
             <img src={shot.imageDataUrl} alt="" style={previewImgStyle} />
           </div>
-          <div style={qrWrapStyle}>
-            <div style={{ fontSize: 13, opacity: 0.7, marginBottom: 8 }}>📱 모바일로 다운로드</div>
-            {qrDataUrl ? (
-              <>
-                <img src={qrDataUrl} alt="QR" style={{ width: 220, height: 220, borderRadius: 6, background: '#fff' }} />
-                {uploadUrl && (
-                  <a href={uploadUrl} target="_blank" rel="noreferrer" style={qrLinkStyle}>또는 링크 열기</a>
-                )}
-              </>
-            ) : uploadError ? (
-              <div style={{ color: '#f77', fontSize: 12 }}>업로드 실패: {uploadError}</div>
+          <div style={sideStyle}>
+            <div style={qrWrapStyle}>
+              <div style={{ fontSize: 13, opacity: 0.75, marginBottom: 8 }}>📱 모바일로 다운로드</div>
+              {qrDataUrl ? (
+                <>
+                  <img src={qrDataUrl} alt="QR" style={qrImgStyle} />
+                  {uploadUrl && (
+                    <a href={uploadUrl} target="_blank" rel="noreferrer" style={qrLinkStyle}>또는 링크 열기</a>
+                  )}
+                </>
+              ) : uploadError ? (
+                <div style={{ color: '#f77', fontSize: 12, textAlign: 'center' }}>업로드 실패<br />{uploadError}</div>
+              ) : (
+                <div style={{ opacity: 0.6, fontSize: 13 }}>업로드 중…</div>
+              )}
+            </div>
+            {!helpOpen ? (
+              <button type="button" onClick={() => setHelpOpen(true)} style={helpToggleBtnStyle}>
+                개선에 도움주기 ▾
+              </button>
             ) : (
-              <div style={{ opacity: 0.6, fontSize: 13 }}>업로드 중…</div>
+              <button type="button" onClick={() => setHelpOpen(false)} style={helpToggleBtnStyleOpen}>
+                개선에 도움주기 ▴
+              </button>
             )}
           </div>
         </div>
 
-        <div style={assignSectionStyle}>
-          <div style={assignTitleStyle}>개선에 도움주기</div>
-          {savedAs ? (
-            <div style={{ color: '#7ee', fontSize: 14 }}>✓ {savedAs}의 사진으로 추가됨</div>
-          ) : analyzing ? (
-            <div style={mutedStyle}>얼굴 분석 중…</div>
-          ) : !primary ? (
-            <div style={mutedStyle}>얼굴이 검출되지 않았어요.</div>
-          ) : (
-            <>
-              <div style={mutedStyle}>이 사람은</div>
-              <div style={btnColStyle}>
-                {primary.matches.map((m) => (
-                  <button
-                    key={m.name}
-                    type="button"
-                    onClick={() => handleAssign(m.name)}
-                    disabled={savingName !== null}
-                    style={assignBtnStyle(savingName === m.name)}
-                  >
-                    {savingName === m.name ? '저장 중…' : `${m.name}입니다 (${(m.similarity * 100).toFixed(0)}%)`}
-                  </button>
+        {helpOpen && (
+          <div style={helpPanelStyle}>
+            {analyzing ? (
+              <div style={mutedStyle}>얼굴 분석 중…</div>
+            ) : faces.length === 0 ? (
+              <div style={mutedStyle}>얼굴이 검출되지 않았어요.</div>
+            ) : (
+              <div style={facesGridStyle}>
+                {faces.map((f, i) => (
+                  <FaceCard
+                    key={i}
+                    face={f}
+                    onAssign={(name) => handleAssign(i, name)}
+                  />
                 ))}
-                {!otherActive ? (
-                  <button
-                    type="button"
-                    onClick={() => setOtherActive(true)}
-                    disabled={savingName !== null}
-                    style={assignBtnStyle(false)}
-                  >
-                    다른 사람입니다
-                  </button>
-                ) : (
-                  <div style={otherRowStyle}>
-                    <input
-                      type="text"
-                      autoFocus
-                      placeholder="이 사람의 이름"
-                      value={otherInput}
-                      onChange={(e) => setOtherInput(e.target.value)}
-                      onKeyDown={(e) => { if (e.key === 'Enter' && otherInput.trim()) handleAssign(otherInput) }}
-                      style={inputStyle}
-                    />
-                    <button
-                      type="button"
-                      onClick={() => handleAssign(otherInput)}
-                      disabled={savingName !== null || !otherInput.trim()}
-                      style={assignBtnStyle(savingName === otherInput.trim())}
-                    >
-                      등록
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => { setOtherActive(false); setOtherInput('') }}
-                      style={cancelBtnStyle}
-                    >
-                      취소
-                    </button>
-                  </div>
-                )}
               </div>
-            </>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function FaceCard(props: { face: FaceData; onAssign: (name: string) => void }) {
+  const { face, onAssign } = props
+  const [otherActive, setOtherActive] = useState(false)
+  const [otherInput, setOtherInput] = useState('')
+  const [saving, setSaving] = useState<string | null>(null)
+
+  async function go(name: string) {
+    setSaving(name)
+    try { await onAssign(name) } finally { setSaving(null) }
+  }
+
+  return (
+    <div style={faceCardStyle}>
+      <div style={faceThumbWrapStyle}>
+        <img src={face.thumbDataUrl} alt="" style={faceThumbImgStyle} />
+      </div>
+      {face.savedAs ? (
+        <div style={{ color: '#7ee', fontSize: 13, marginTop: 8, textAlign: 'center' }}>
+          ✓ {face.savedAs}
+        </div>
+      ) : (
+        <div style={faceBtnsStyle}>
+          <div style={faceLabelStyle}>이 사람은</div>
+          {face.matches.map((m) => (
+            <button
+              key={m.name}
+              type="button"
+              onClick={() => go(m.name)}
+              disabled={saving !== null}
+              style={assignBtnStyle(saving === m.name)}
+            >
+              {saving === m.name ? '저장 중…' : `${m.name}입니다 (${(m.similarity * 100).toFixed(0)}%)`}
+            </button>
+          ))}
+          {!otherActive ? (
+            <button
+              type="button"
+              onClick={() => setOtherActive(true)}
+              disabled={saving !== null}
+              style={assignBtnStyle(false)}
+            >
+              다른 사람입니다
+            </button>
+          ) : (
+            <div style={otherRowStyle}>
+              <input
+                type="text"
+                autoFocus
+                placeholder="이름"
+                value={otherInput}
+                onChange={(e) => setOtherInput(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter' && otherInput.trim()) go(otherInput) }}
+                style={inputStyle}
+              />
+              <button
+                type="button"
+                onClick={() => go(otherInput)}
+                disabled={saving !== null || !otherInput.trim()}
+                style={assignBtnStyle(saving === otherInput.trim())}
+              >
+                등록
+              </button>
+              <button
+                type="button"
+                onClick={() => { setOtherActive(false); setOtherInput('') }}
+                style={cancelBtnStyle}
+              >
+                취소
+              </button>
+            </div>
           )}
         </div>
-      </div>
+      )}
     </div>
   )
 }
@@ -208,11 +247,10 @@ function loadImage(dataUrl: string): Promise<HTMLImageElement> {
   })
 }
 
-async function cropFaceFromDataUrl(
-  dataUrl: string,
+async function cropFaceFromImage(
+  img: HTMLImageElement,
   box: { x: number; y: number; width: number; height: number },
 ): Promise<string> {
-  const img = await loadImage(dataUrl)
   const PAD = 0.25
   const padW = box.width * PAD
   const padH = box.height * PAD
@@ -229,57 +267,90 @@ async function cropFaceFromDataUrl(
 }
 
 const backdropStyle: React.CSSProperties = {
-  position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.78)', zIndex: 100,
+  position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.82)', zIndex: 100,
   display: 'flex', alignItems: 'center', justifyContent: 'center',
-  padding: 20, overflow: 'auto',
+  padding: '5vh 5vw',
 }
 const contentStyle: React.CSSProperties = {
   position: 'relative',
   background: '#13161a', color: '#e8e8e8',
-  borderRadius: 14, padding: 20, maxWidth: 880, width: '100%',
+  borderRadius: 14, padding: 22,
+  width: '90vw', maxWidth: 1600,
+  maxHeight: '90vh',
   border: '1px solid rgba(255,255,255,0.1)',
-  maxHeight: 'calc(100vh - 40px)', overflow: 'auto',
+  overflow: 'auto',
   fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+  display: 'flex', flexDirection: 'column', gap: 16,
 }
 const closeBtnStyle: React.CSSProperties = {
-  position: 'absolute', top: 10, right: 12,
+  position: 'absolute', top: 12, right: 14,
   background: 'transparent', border: 'none', color: '#aaa',
-  cursor: 'pointer', fontSize: 22, padding: 6,
+  cursor: 'pointer', fontSize: 24, padding: 6, zIndex: 1,
 }
-const topRowStyle: React.CSSProperties = {
-  display: 'flex', gap: 16, flexWrap: 'wrap', marginBottom: 16, marginTop: 6,
+const mainAreaStyle: React.CSSProperties = {
+  display: 'flex', gap: 18, flexWrap: 'wrap', minHeight: 0,
 }
 const previewWrapStyle: React.CSSProperties = {
-  flex: '1 1 320px', minWidth: 280, maxWidth: 540,
+  flex: '1 1 0', minWidth: 280,
   background: '#000', borderRadius: 8, overflow: 'hidden',
   display: 'flex', alignItems: 'center', justifyContent: 'center',
+  minHeight: 200,
 }
-const previewImgStyle: React.CSSProperties = { width: '100%', height: 'auto', display: 'block' }
+const previewImgStyle: React.CSSProperties = {
+  maxWidth: '100%', maxHeight: '70vh', height: 'auto', width: 'auto', display: 'block',
+}
+const sideStyle: React.CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: 14, minWidth: 280, maxWidth: 320,
+}
 const qrWrapStyle: React.CSSProperties = {
   display: 'flex', flexDirection: 'column', alignItems: 'center',
-  padding: 12, background: 'rgba(255,255,255,0.04)', borderRadius: 8,
-  minWidth: 240,
+  padding: 14, background: 'rgba(255,255,255,0.04)', borderRadius: 8,
 }
+const qrImgStyle: React.CSSProperties = { width: 240, height: 240, borderRadius: 6, background: '#fff' }
 const qrLinkStyle: React.CSSProperties = { color: '#7ee', fontSize: 12, marginTop: 8, textDecoration: 'none' }
-const assignSectionStyle: React.CSSProperties = {
-  borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: 14,
+const helpToggleBtnStyle: React.CSSProperties = {
+  background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.3)',
+  color: '#fff', padding: '12px 18px', borderRadius: 8, cursor: 'pointer',
+  fontSize: 14, fontFamily: 'inherit',
 }
-const assignTitleStyle: React.CSSProperties = { fontSize: 14, fontWeight: 700, marginBottom: 6 }
-const mutedStyle: React.CSSProperties = { opacity: 0.7, fontSize: 13, marginBottom: 8 }
-const btnColStyle: React.CSSProperties = { display: 'flex', flexDirection: 'column', gap: 6 }
+const helpToggleBtnStyleOpen: React.CSSProperties = {
+  ...helpToggleBtnStyle,
+  background: 'rgba(126,238,238,0.18)', borderColor: 'rgba(126,238,238,0.7)',
+}
+const helpPanelStyle: React.CSSProperties = {
+  borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: 16,
+}
+const facesGridStyle: React.CSSProperties = {
+  display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(220px, 1fr))', gap: 14,
+}
+const faceCardStyle: React.CSSProperties = {
+  background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)',
+  borderRadius: 10, padding: 12,
+  display: 'flex', flexDirection: 'column',
+}
+const faceThumbWrapStyle: React.CSSProperties = {
+  width: '100%', aspectRatio: '1 / 1', borderRadius: 8, overflow: 'hidden',
+  background: '#000',
+}
+const faceThumbImgStyle: React.CSSProperties = { width: '100%', height: '100%', objectFit: 'cover' }
+const faceBtnsStyle: React.CSSProperties = {
+  display: 'flex', flexDirection: 'column', gap: 6, marginTop: 10,
+}
+const faceLabelStyle: React.CSSProperties = { fontSize: 12, opacity: 0.75 }
 const assignBtnStyle = (loading: boolean): React.CSSProperties => ({
   background: loading ? 'rgba(126,238,238,0.35)' : 'rgba(126,238,238,0.18)',
   border: '1px solid rgba(126,238,238,0.7)',
-  color: '#fff', padding: '10px 14px', borderRadius: 6, cursor: 'pointer',
-  fontSize: 15, fontFamily: 'inherit', textAlign: 'left',
+  color: '#fff', padding: '8px 12px', borderRadius: 6, cursor: 'pointer',
+  fontSize: 13, fontFamily: 'inherit', textAlign: 'left',
 })
 const cancelBtnStyle: React.CSSProperties = {
   background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.25)',
-  color: '#fff', padding: '8px 12px', borderRadius: 6, cursor: 'pointer', fontSize: 13,
+  color: '#fff', padding: '6px 10px', borderRadius: 6, cursor: 'pointer', fontSize: 12,
 }
-const otherRowStyle: React.CSSProperties = { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }
+const otherRowStyle: React.CSSProperties = { display: 'flex', gap: 4, alignItems: 'center', flexWrap: 'wrap' }
 const inputStyle: React.CSSProperties = {
-  flex: 1, minWidth: 160,
+  flex: 1, minWidth: 110,
   background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.35)',
-  color: '#fff', padding: '8px 12px', borderRadius: 6, fontSize: 14, outline: 'none',
+  color: '#fff', padding: '6px 10px', borderRadius: 5, fontSize: 13, outline: 'none',
 }
+const mutedStyle: React.CSSProperties = { opacity: 0.7, fontSize: 13 }
