@@ -25,10 +25,11 @@ const MASK_REFRESH_MS = 60
 const OBJECT_REFRESH_MS = 25
 const FPS_UPDATE_MS = 500
 const FACE_REFRESH_MS = 700        // 얼굴 검출 + 임베딩 호출 주기 (≈1.4fps — DB 쿼리 부담 줄임)
-// 이제 RPC가 Euclidean 거리 기반 (face-api 표준). 같은 사람 80-100%, 닮은 60-80%, 다른 50% 이하
-const MATCH_THRESHOLD = 0.4        // similarity 임계 (distance ≤ 0.6 ~ face-api 표준)
-const MATCH_TOP_K = 20             // dedupe 후 unique 이름 3개 뽑기 위해 raw 매칭 여러 개
-const DISPLAY_TOP_N = 3
+// RPC가 Euclidean 거리 기반 (face-api 표준). 같은 사람 80-100%, 닮은 60-80%, 무관 50% 이하
+// similarity = 1 - euclidean_distance (모든 후보에 동일 공식 = 같은 스케일)
+const MATCH_THRESHOLD = 0.0        // 임계 0 — top-4 표시용이라 낮은 후보도 받음 (의미 없으면 row 자체가 없음)
+const MATCH_TOP_K = 30             // dedupe 후 unique 4명 확보용
+const DISPLAY_TOP_N = 4            // 1+3 (큰 + 작은 inline)
 
 type Status = 'idle' | 'loading-model' | 'requesting-camera' | 'running' | 'error'
 type BBox = { x: number; y: number; w: number; h: number }
@@ -581,26 +582,29 @@ function drawIdentityLabel(
   ctx.save()
   ctx.font = 'bold 20px ui-sans-serif, system-ui, sans-serif'
   const headFont = ctx.font
-  ctx.font = '14px ui-sans-serif, system-ui, sans-serif'
+  ctx.font = '13px ui-sans-serif, system-ui, sans-serif'
   const subFont = ctx.font
 
+  // 1줄: 큰 1위 / 2줄: 2~4위 가로 inline
   const headLine = dedup.length > 0
     ? `${dedup[0].name} (${(dedup[0].similarity * 100).toFixed(0)}%)`
     : (t.lastFaceProcessedAt === 0 ? 'Searching…' : 'Unknown')
-  const subLines = dedup.slice(1).map((d) => `${d.name} (${(d.similarity * 100).toFixed(0)}%)`)
+
+  const others = dedup.slice(1)
+  const subLine = others.map((d) => `${d.name} (${(d.similarity * 100).toFixed(0)}%)`).join('   ')
 
   ctx.font = headFont
   const headW = ctx.measureText(headLine).width
   ctx.font = subFont
-  const subW = Math.max(0, ...subLines.map((s) => ctx.measureText(s).width))
+  const subW = subLine ? ctx.measureText(subLine).width : 0
 
   const padX = 14
   const padY = 8
   const headH = 26
-  const subH = 18
-  const gap = subLines.length > 0 ? 4 : 0
+  const subH = subLine ? 18 : 0
+  const gap = subLine ? 4 : 0
   const boxW = Math.max(headW, subW) + padX * 2
-  const boxH = padY + headH + gap + subLines.length * subH + padY
+  const boxH = padY + headH + gap + subH + padY
 
   let bx = cx - boxW / 2
   let by = yTop - boxH - 10
@@ -618,12 +622,10 @@ function drawIdentityLabel(
   ctx.font = headFont
   ctx.fillStyle = '#fff'
   ctx.fillText(headLine, bx + padX, by + padY)
-  ctx.font = subFont
-  ctx.fillStyle = '#aaa'
-  let lineY = by + padY + headH + gap
-  for (const s of subLines) {
-    ctx.fillText(s, bx + padX, lineY)
-    lineY += subH
+  if (subLine) {
+    ctx.font = subFont
+    ctx.fillStyle = '#aaa'
+    ctx.fillText(subLine, bx + padX, by + padY + headH + gap)
   }
   ctx.restore()
 }
