@@ -422,6 +422,13 @@ function lerp(a: number, b: number, t: number): number { return a + (b - a) * t 
 
 // 전체 비디오 프레임에서 얼굴 검출 + 임베딩 → DB 매칭 → 트랙에 결과 캐싱
 async function processFaceMatching(video: HTMLVideoElement, tracks: Track[]) {
+  const now = performance.now()
+
+  // 시도 자체는 매 사이클 기록 — "Searching…"이 영구적이지 않게
+  for (const t of tracks) {
+    if (t.lastFaceProcessedAt === 0) t.lastFaceProcessedAt = now
+  }
+
   let faces: Awaited<ReturnType<typeof extractAllEmbeddings>>
   try {
     faces = await extractAllEmbeddings(video)
@@ -440,7 +447,6 @@ async function processFaceMatching(video: HTMLVideoElement, tracks: Track[]) {
       const headCx = t.bbox.x + t.bbox.w / 2
       const headCy = t.bbox.y + Math.min(t.bbox.h * 0.25, face.box.height * 0.8)
       const d = Math.hypot(fcx - headCx, fcy - headCy)
-      // 트랙 박스 안에 있거나 가까이 있어야
       const inside = fcx >= t.bbox.x && fcx <= t.bbox.x + t.bbox.w &&
                      fcy >= t.bbox.y && fcy <= t.bbox.y + t.bbox.h * 0.6
       const dScore = inside ? d * 0.5 : d
@@ -448,7 +454,6 @@ async function processFaceMatching(video: HTMLVideoElement, tracks: Track[]) {
     }
     if (!best) continue
 
-    // DB 매칭 — face descriptor를 vector array로 변환
     try {
       const results = await matchFace(Array.from(face.descriptor), MATCH_TOP_K, MATCH_THRESHOLD)
       best.matches = results

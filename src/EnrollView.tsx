@@ -241,6 +241,19 @@ export function EnrollView() {
       </section>
 
       <section style={cardStyle}>
+        <h2 style={sectionTitleStyle}>Capture from camera</h2>
+        <CameraCapture
+          name={name}
+          disabled={loadingModels}
+          onEnrolled={(captured) => {
+            setMessage({ text: `Captured & enrolled "${captured}"`, ok: true })
+            refreshList()
+          }}
+          onError={(text) => setMessage({ text, ok: false })}
+        />
+      </section>
+
+      <section style={cardStyle}>
         <h2 style={sectionTitleStyle}>Enrolled ({employees.length} embeddings · {grouped.length} people)</h2>
         {grouped.length === 0 ? (
           <div style={mutedStyle}>No one enrolled yet.</div>
@@ -275,6 +288,128 @@ export function EnrollView() {
       <p style={tipStyle}>
         Tip: 정면, 균일한 조명, 얼굴이 사진의 30% 이상인 사진을 사용하세요. 한 사람당 1장이면 충분하지만, 3-5장을 등록하면 인식률이 더 좋아집니다 (이름은 동일하게).
       </p>
+    </div>
+  )
+}
+
+function CameraCapture(props: {
+  name: string
+  disabled: boolean
+  onEnrolled: (capturedName: string) => void
+  onError: (message: string) => void
+}) {
+  const { name, disabled, onEnrolled, onError } = props
+  const [open, setOpen] = useState(false)
+  const [capturing, setCapturing] = useState(false)
+  const [recentCount, setRecentCount] = useState(0)
+  const videoRef = useRef<HTMLVideoElement>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+
+  useEffect(() => {
+    if (!open) return
+    let cancelled = false
+    async function start() {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user' },
+          audio: false,
+        })
+        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return }
+        streamRef.current = stream
+        const video = videoRef.current
+        if (video) {
+          video.srcObject = stream
+          await video.play()
+        }
+      } catch (e) {
+        onError(`Camera open failed: ${e instanceof Error ? e.message : String(e)}`)
+        setOpen(false)
+      }
+    }
+    start()
+    return () => {
+      cancelled = true
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop())
+        streamRef.current = null
+      }
+    }
+  }, [open, onError])
+
+  async function capture() {
+    if (!name.trim()) {
+      onError('Enter a name first.')
+      return
+    }
+    const video = videoRef.current
+    if (!video || video.readyState < 2) {
+      onError('Camera not ready')
+      return
+    }
+    setCapturing(true)
+    try {
+      const canvas = document.createElement('canvas')
+      canvas.width = video.videoWidth
+      canvas.height = video.videoHeight
+      // 좌우 반전된 미리보기와 매칭되도록 그대로 그림 (실제 이미지는 mirror 안 함 = 실제 얼굴 방향)
+      const ctx = canvas.getContext('2d')!
+      ctx.drawImage(video, 0, 0)
+
+      const result = await extractSingleEmbedding(canvas)
+      if (!result) {
+        onError('No face detected. Center your face in the frame.')
+        return
+      }
+      const captured = name.trim()
+      await insertEmployee(captured, Array.from(result.descriptor), `webcam-${new Date().toISOString()}`)
+      setRecentCount((c) => c + 1)
+      onEnrolled(captured)
+    } catch (e) {
+      onError(`Capture failed: ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setCapturing(false)
+    }
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={mutedStyle}>
+        위 "Add a person" 섹션에서 이름을 입력하신 뒤 카메라를 켜고 촬영하세요. 한 사람당 다른 각도/표정으로 여러 장 촬영하면 인식률이 크게 올라갑니다.
+      </div>
+      {!open ? (
+        <button
+          type="button"
+          onClick={() => setOpen(true)}
+          disabled={disabled}
+          style={primaryBtnStyle}
+        >
+          Open camera
+        </button>
+      ) : (
+        <>
+          <div style={{ position: 'relative', maxWidth: 480 }}>
+            <video
+              ref={videoRef}
+              playsInline
+              muted
+              style={{ width: '100%', borderRadius: 8, transform: 'scaleX(-1)', background: '#000' }}
+            />
+          </div>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button type="button" onClick={capture} disabled={capturing || disabled || !name.trim()} style={primaryBtnStyle}>
+              {capturing ? 'Processing…' : '📸 Capture'}
+            </button>
+            <button type="button" onClick={() => setOpen(false)} style={secondaryBtnStyle}>
+              Close camera
+            </button>
+            {recentCount > 0 && (
+              <span style={{ ...mutedStyle, alignSelf: 'center' }}>
+                이번 세션에서 {recentCount}장 등록됨
+              </span>
+            )}
+          </div>
+        </>
+      )}
     </div>
   )
 }
@@ -393,6 +528,14 @@ const rowStyle: React.CSSProperties = {
   display: 'flex', alignItems: 'center', gap: 12,
   padding: '8px 10px', background: 'rgba(255,255,255,0.03)',
   border: '1px solid rgba(255,255,255,0.08)', borderRadius: 6,
+}
+const primaryBtnStyle: React.CSSProperties = {
+  background: 'rgba(126,238,238,0.18)', border: '1px solid rgba(126,238,238,0.7)',
+  color: '#fff', padding: '8px 14px', borderRadius: 6, cursor: 'pointer', fontSize: 14,
+}
+const secondaryBtnStyle: React.CSSProperties = {
+  background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.25)',
+  color: '#fff', padding: '8px 14px', borderRadius: 6, cursor: 'pointer', fontSize: 14,
 }
 const deleteBtnStyle: React.CSSProperties = {
   background: 'rgba(255,80,80,0.15)', border: '1px solid rgba(255,80,80,0.5)',
