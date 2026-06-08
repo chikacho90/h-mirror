@@ -49,9 +49,8 @@ export function ShutterModal(props: { shot: ShutterShotState; onClose: () => voi
     return () => { cancelled = true }
   }, [shot])
 
-  // help 패널 열릴 때만 얼굴 검출 (불필요한 매칭 회피)
+  // 모달 마운트 시 얼굴 검출 (deps에 setState 값들이 있으면 cancellation 버그 → 마운트에서 한번만)
   useEffect(() => {
-    if (!helpOpen || faces.length > 0 || analyzing) return
     let cancelled = false
     setAnalyzing(true)
     ;(async () => {
@@ -81,7 +80,7 @@ export function ShutterModal(props: { shot: ShutterShotState; onClose: () => voi
       }
     })()
     return () => { cancelled = true }
-  }, [helpOpen, shot, faces.length, analyzing])
+  }, [shot])
 
   async function handleAssign(idx: number, name: string) {
     const trimmed = name.trim()
