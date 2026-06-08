@@ -7,12 +7,9 @@ import {
   type ImageSegmenterResult,
 } from '@mediapipe/tasks-vision'
 import { AdminView } from './AdminView'
-import { ReviewModal } from './ReviewModal'
+import { ShutterModal, type ShutterShotState } from './ShutterModal'
 import { extractAllEmbeddings, loadFaceModels } from './lib/faceApi'
-import {
-  countPendingCaptures, insertEmployee, insertPendingCapture,
-  listEmployeeNames, matchFace, type MatchResult,
-} from './lib/supabase'
+import { autoCapture, matchFace, type MatchResult } from './lib/supabase'
 
 const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm'
 const OBJ_MODEL = 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite'
@@ -31,14 +28,14 @@ const FPS_UPDATE_MS = 500
 const FACE_REFRESH_MS = 700        // 얼굴 검출 + 임베딩 호출 주기 (≈1.4fps — DB 쿼리 부담 줄임)
 // RPC가 Euclidean 거리 기반 (face-api 표준). 같은 사람 80-100%, 닮은 60-80%, 무관 50% 이하
 // similarity = 1 - euclidean_distance (모든 후보에 동일 공식 = 같은 스케일)
-const MATCH_THRESHOLD = 0.0        // 임계 0 — top-4 표시용이라 낮은 후보도 받음 (의미 없으면 row 자체가 없음)
-const MATCH_TOP_K = 30             // dedupe 후 unique 4명 확보용
-const DISPLAY_TOP_N = 4            // 1+3 (큰 + 작은 inline)
-// 자동 캡쳐 — 메인페이지에 지나가는 사람들을 모아서 review 풀에 쌓아둠
+const MATCH_THRESHOLD = 0.0        // 임계 0 — top-N 표시용이라 낮은 후보도 받음
+const MATCH_TOP_K = 30             // dedupe 후 unique 3명 확보용
+const DISPLAY_TOP_N = 3            // 한 줄에 top-3 (1위 강조)
+// 자동 캡쳐 — 메인페이지에 지나가는 사람들을 자동 분류 (높음=직접 추가 / 낮음=admin 후보 풀)
 const AUTO_CAPTURE_MIN_TRACK_AGE_MS = 1500   // 트랙이 안정될 때까지 기다림
 const AUTO_CAPTURE_COOLDOWN_MS = 30000       // 같은 트랙은 30초마다 1장만
 const AUTO_CAPTURE_MIN_FACE_PX = 56          // 너무 작은 얼굴 (먼 거리) 스킵
-const PENDING_COUNT_REFRESH_MS = 30000       // 도움 버튼 배지 새로고침
+const AUTO_CAPTURE_HIGH_CONF = 0.6           // 이 이상은 자동으로 해당 인물 풀에 추가
 
 type Status = 'idle' | 'loading-model' | 'requesting-camera' | 'running' | 'error'
 type BBox = { x: number; y: number; w: number; h: number }
@@ -90,11 +87,9 @@ function RecognizeView() {
   const [fsUiVisible, setFsUiVisible] = useState(true)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [cameras, setCameras] = useState<MediaDeviceInfo[]>([])
-  const [captureModal, setCaptureModal] = useState<CaptureModalState | null>(null)
-  const [capturing, setCapturing] = useState(false)
+  const [shutterShot, setShutterShot] = useState<ShutterShotState | null>(null)
+  const [shuttering, setShuttering] = useState(false)
   const [cameraDeviceId, setCameraDeviceId] = useState<string | null>(null)
-  const [showReview, setShowReview] = useState(false)
-  const [pendingCount, setPendingCount] = useState(0)
   // 트랙 id 별 마지막 자동 캡쳐 시각 — 같은 사람 spam 방지
   const autoCaptureCooldownRef = useRef<Map<number, number>>(new Map())
 
@@ -142,20 +137,6 @@ function RecognizeView() {
     function onChange() { setIsFullscreen(!!document.fullscreenElement) }
     document.addEventListener('fullscreenchange', onChange)
     return () => document.removeEventListener('fullscreenchange', onChange)
-  }, [])
-
-  // pending capture 개수 주기적 새로고침 (도움 버튼 배지용)
-  useEffect(() => {
-    let cancelled = false
-    async function fetchCount() {
-      try {
-        const c = await countPendingCaptures()
-        if (!cancelled) setPendingCount(c)
-      } catch { /* skip */ }
-    }
-    fetchCount()
-    const id = setInterval(fetchCount, PENDING_COUNT_REFRESH_MS)
-    return () => { cancelled = true; clearInterval(id) }
   }, [])
 
   useEffect(() => {
@@ -354,7 +335,6 @@ function RecognizeView() {
       faceProcessingRef.current = true
       processFaceMatching(video, tracksRef.current, {
         cooldown: autoCaptureCooldownRef.current,
-        onCaptured: () => setPendingCount((c) => c + 1),
       }).finally(() => {
         faceProcessingRef.current = false
       })
@@ -381,82 +361,49 @@ function RecognizeView() {
         <StatusOverlay status={status} errorMsg={errorMsg} fps={fps} trackCount={trackCount} faceReady={faceReady} />
       )}
 
-      {/* Enroll 링크 제거됨 — 관리 페이지는 #admin 으로 URL 직접 입력해서 진입 */}
-
-      <BottomPanel
-        open={panelOpen}
-        toggle={() => setPanelOpen((v) => !v)}
-        shape={shape}
-        target={target}
-        cameras={cameras}
-        cameraDeviceId={cameraDeviceId}
-        setShape={setShape}
-        setTarget={setTarget}
-        setCameraDeviceId={setCameraDeviceId}
-      />
-
-      {fsUiVisible && (<FullscreenButton isFullscreen={isFullscreen} />)}
-
-      {/* 우하단 도움 버튼 — 자동 캡쳐된 얼굴 분류/확정 모달 열기 */}
+      {/* 하단 중앙: 셔터 버튼 */}
       {fsUiVisible && (
         <button
           type="button"
-          onClick={() => setShowReview(true)}
-          title="Help improve recognition"
-          style={helpBtnStyle}
+          onClick={handleShutter}
+          disabled={shuttering}
+          title="Capture"
+          style={shutterBtnStyle(shuttering)}
+          aria-label="Shutter"
         >
-          💡
-          {pendingCount > 0 && <span style={helpBadgeStyle}>{pendingCount > 99 ? '99+' : pendingCount}</span>}
+          <span style={shutterInnerStyle} />
         </button>
       )}
 
-      {showReview && (
-        <ReviewModal
-          onClose={() => setShowReview(false)}
-          onChange={async () => {
-            try { setPendingCount(await countPendingCaptures()) } catch { /* skip */ }
-          }}
-        />
-      )}
-
-      {/* 좌하단 캡쳐 버튼 — 현재 프레임 잡아서 인물 태깅 모달 띄움 */}
+      {/* 우하단 클러스터: 설정 + 전체화면 */}
       {fsUiVisible && (
-        <button
-          type="button"
-          onClick={handleCapture}
-          disabled={!faceReady || capturing}
-          title="Capture & tag faces"
-          style={captureBtnStyle(capturing)}
-        >
-          {capturing ? '…' : '📸'}
-        </button>
+        <div style={rightClusterStyle}>
+          <BottomPanel
+            open={panelOpen}
+            toggle={() => setPanelOpen((v) => !v)}
+            shape={shape}
+            target={target}
+            cameras={cameras}
+            cameraDeviceId={cameraDeviceId}
+            setShape={setShape}
+            setTarget={setTarget}
+            setCameraDeviceId={setCameraDeviceId}
+          />
+          <FullscreenButton isFullscreen={isFullscreen} />
+        </div>
       )}
 
-      {captureModal && (
-        <CaptureTagModal
-          state={captureModal}
-          onCancel={() => setCaptureModal(null)}
-          onSave={async (assignments) => {
-            for (const a of assignments) {
-              await insertEmployee(
-                a.name,
-                Array.from(a.descriptor),
-                `webcam-${new Date().toISOString()}`,
-                a.image_data,
-              )
-            }
-            setCaptureModal(null)
-          }}
-        />
+      {shutterShot && (
+        <ShutterModal shot={shutterShot} onClose={() => setShutterShot(null)} />
       )}
     </div>
   )
 
-  async function handleCapture() {
-    if (capturing) return
+  async function handleShutter() {
+    if (shuttering) return
     const video = videoRef.current
     if (!video || video.readyState < 2) return
-    setCapturing(true)
+    setShuttering(true)
     try {
       const cap = document.createElement('canvas')
       cap.width = video.videoWidth
@@ -468,38 +415,19 @@ function RecognizeView() {
       }
       ctx.drawImage(video, 0, 0)
       ctx.setTransform(1, 0, 0, 1, 0, 0)
-
-      const faces = await extractAllEmbeddings(cap)
-      if (faces.length === 0) {
-        alert('No faces detected in the captured frame.')
-        return
-      }
-      const existingNames = await listEmployeeNames()
-      const detected: CaptureFaceState[] = []
-      for (const f of faces) {
-        let topMatches: MatchResult[] = []
-        try { topMatches = await matchFace(Array.from(f.descriptor), 3, 0.2) } catch { /* skip */ }
-        detected.push({
-          box: f.box,
-          descriptor: f.descriptor,
-          topMatches,
-          assignment: {
-            name: topMatches[0]?.name ?? '',
-            mode: topMatches.length > 0 ? 'existing' : 'new',
-          },
-        })
-      }
-      setCaptureModal({
-        imageDataUrl: cap.toDataURL('image/jpeg', 0.85),
+      const blob: Blob = await new Promise((resolve, reject) => {
+        cap.toBlob((b) => b ? resolve(b) : reject(new Error('toBlob failed')), 'image/jpeg', 0.9)
+      })
+      setShutterShot({
+        imageDataUrl: cap.toDataURL('image/jpeg', 0.88),
+        imageBlob: blob,
         imageW: cap.width,
         imageH: cap.height,
-        faces: detected,
-        existingNames,
       })
     } catch (e) {
       alert(`Capture failed: ${e instanceof Error ? e.message : String(e)}`)
     } finally {
-      setCapturing(false)
+      setShuttering(false)
     }
   }
 }
@@ -566,7 +494,7 @@ function lerp(a: number, b: number, t: number): number { return a + (b - a) * t 
 async function processFaceMatching(
   video: HTMLVideoElement,
   tracks: Track[],
-  autoCfg: { cooldown: Map<number, number>; onCaptured: () => void },
+  autoCfg: { cooldown: Map<number, number> },
 ) {
   const now = performance.now()
 
@@ -619,41 +547,15 @@ async function processFaceMatching(
       autoCfg.cooldown.set(best.id, now)
       const thumb = cropFaceThumb(video, face.box)
       const top = best.matches[0]
-      // fire-and-forget — UI를 막지 않도록
-      insertPendingCapture({
-        image_data: thumb,
+      // fire-and-forget — UI 안 막음. autoCapture가 신뢰도 보고 직접추가/pending 분기
+      autoCapture({
         embedding: Array.from(face.descriptor),
-        auto_top_name: top?.name ?? null,
-        auto_top_similarity: top?.similarity ?? null,
-      }).then(() => autoCfg.onCaptured()).catch(() => { /* skip */ })
+        image_data: thumb,
+        topMatch: top ? { name: top.name, similarity: top.similarity } : null,
+        highConfThreshold: AUTO_CAPTURE_HIGH_CONF,
+      }).catch(() => { /* skip */ })
     }
   }
-}
-
-function loadImageFromDataUrl(dataUrl: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const img = new Image()
-    img.onload = () => resolve(img)
-    img.onerror = reject
-    img.src = dataUrl
-  })
-}
-
-function cropFromImage(img: HTMLImageElement, box: { x: number; y: number; width: number; height: number }): string {
-  const SIZE = 200
-  const PAD = 0.25
-  const padW = box.width * PAD
-  const padH = box.height * PAD
-  const sx = Math.max(0, box.x - padW)
-  const sy = Math.max(0, box.y - padH)
-  const sw = Math.min(img.width - sx, box.width + padW * 2)
-  const sh = Math.min(img.height - sy, box.height + padH * 2)
-  const canvas = document.createElement('canvas')
-  canvas.width = SIZE
-  canvas.height = SIZE
-  const ctx = canvas.getContext('2d')!
-  ctx.drawImage(img, sx, sy, sw, sh, 0, 0, SIZE, SIZE)
-  return canvas.toDataURL('image/jpeg', 0.78)
 }
 
 function cropFaceThumb(video: HTMLVideoElement, box: { x: number; y: number; width: number; height: number }): string {
@@ -696,7 +598,7 @@ function drawIdentityLabel(
   const yTop = Math.max(28, t.bbox.y)
   const color = colorForId(t.id)
 
-  // 매칭 결과 — 이름 기준 dedupe 후 unique top-N 추출
+  // 매칭 결과 — 이름 기준 dedupe 후 unique top-3
   const dedup: { name: string; similarity: number }[] = []
   for (const m of t.matches) {
     if (!dedup.find((d) => d.name === m.name)) dedup.push(m)
@@ -704,31 +606,31 @@ function drawIdentityLabel(
   }
 
   ctx.save()
-  ctx.font = 'bold 20px ui-sans-serif, system-ui, sans-serif'
-  const headFont = ctx.font
-  ctx.font = '13px ui-sans-serif, system-ui, sans-serif'
-  const subFont = ctx.font
+  const primaryFont = 'bold 20px ui-sans-serif, system-ui, sans-serif'
+  const otherFont = '13px ui-sans-serif, system-ui, sans-serif'
+  const GAP = 12   // top-1 ↔ top-2/3 사이 가로 간격
 
-  // 1줄: 큰 1위 / 2줄: 2~4위 가로 inline
-  const headLine = dedup.length > 0
-    ? `${dedup[0].name} (${(dedup[0].similarity * 100).toFixed(0)}%)`
-    : (t.lastFaceProcessedAt === 0 ? 'Searching…' : 'Unknown')
-
-  const others = dedup.slice(1)
-  const subLine = others.map((d) => `${d.name} (${(d.similarity * 100).toFixed(0)}%)`).join('   ')
-
-  ctx.font = headFont
-  const headW = ctx.measureText(headLine).width
-  ctx.font = subFont
-  const subW = subLine ? ctx.measureText(subLine).width : 0
-
+  // 한 줄에 top-3: top-1 강조(큰글씨) + GAP + top-2,3 inline
   const padX = 14
   const padY = 8
   const headH = 26
-  const subH = subLine ? 18 : 0
-  const gap = subLine ? 4 : 0
-  const boxW = Math.max(headW, subW) + padX * 2
-  const boxH = padY + headH + gap + subH + padY
+
+  let primaryText = ''
+  if (dedup.length > 0) {
+    primaryText = `${dedup[0].name} (${(dedup[0].similarity * 100).toFixed(0)}%)`
+  } else {
+    primaryText = t.lastFaceProcessedAt === 0 ? 'Searching…' : 'Unknown'
+  }
+  const others = dedup.slice(1)
+  const othersText = others.map((d) => `${d.name} (${(d.similarity * 100).toFixed(0)}%)`).join('   ')
+
+  ctx.font = primaryFont
+  const primaryW = ctx.measureText(primaryText).width
+  ctx.font = otherFont
+  const othersW = othersText ? ctx.measureText(othersText).width : 0
+  const contentW = primaryW + (othersText ? GAP + othersW : 0)
+  const boxW = contentW + padX * 2
+  const boxH = padY + headH + padY
 
   let bx = cx - boxW / 2
   let by = yTop - boxH - 10
@@ -742,14 +644,15 @@ function drawIdentityLabel(
   ctx.lineWidth = 1.5
   ctx.strokeRect(bx, by, boxW, boxH)
 
-  ctx.textBaseline = 'top'
-  ctx.font = headFont
+  ctx.textBaseline = 'alphabetic'
+  const textY = by + padY + 20    // baseline 위치 (20px 글씨 기준)
+  ctx.font = primaryFont
   ctx.fillStyle = '#fff'
-  ctx.fillText(headLine, bx + padX, by + padY)
-  if (subLine) {
-    ctx.font = subFont
+  ctx.fillText(primaryText, bx + padX, textY)
+  if (othersText) {
+    ctx.font = otherFont
     ctx.fillStyle = '#aaa'
-    ctx.fillText(subLine, bx + padX, by + padY + headH + gap)
+    ctx.fillText(othersText, bx + padX + primaryW + GAP, textY)
   }
   ctx.restore()
 }
@@ -1026,186 +929,6 @@ function targetLabel(t: TargetMode): string {
   return ({ 'none': 'None', 'full-body': 'Full body', 'face': 'Face' } as const)[t]
 }
 
-// ─── 캡쳐 모달 — 잡은 프레임에서 인물 태깅 ─────────────
-
-type CaptureFaceState = {
-  box: { x: number; y: number; width: number; height: number }
-  descriptor: Float32Array
-  topMatches: MatchResult[]
-  assignment: { name: string; mode: 'existing' | 'new' }
-}
-type CaptureModalState = {
-  imageDataUrl: string
-  imageW: number
-  imageH: number
-  faces: CaptureFaceState[]
-  existingNames: string[]
-}
-
-function CaptureTagModal(props: {
-  state: CaptureModalState
-  onCancel: () => void
-  onSave: (assignments: Array<{ name: string; descriptor: Float32Array; image_data: string }>) => Promise<void>
-}) {
-  const { state, onCancel, onSave } = props
-  const [faces, setFaces] = useState<CaptureFaceState[]>(state.faces)
-  const [saving, setSaving] = useState(false)
-
-  function patchFace(idx: number, patch: Partial<CaptureFaceState['assignment']>) {
-    setFaces((prev) => prev.map((f, i) => (i === idx ? { ...f, assignment: { ...f.assignment, ...patch } } : f)))
-  }
-
-  const validAssignments = faces.filter((f) => f.assignment.name.trim())
-
-  async function handleSave() {
-    if (validAssignments.length === 0) return
-    setSaving(true)
-    try {
-      // 저장 시 각 얼굴을 캡쳐 이미지에서 잘라 200x200 썸네일로 같이 저장
-      const sourceImg = await loadImageFromDataUrl(state.imageDataUrl)
-      const payload = validAssignments.map((f) => ({
-        name: f.assignment.name.trim(),
-        descriptor: f.descriptor,
-        image_data: cropFromImage(sourceImg, f.box),
-      }))
-      await onSave(payload)
-    } catch (e) {
-      alert(`Save failed: ${e instanceof Error ? e.message : String(e)}`)
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  // 이미지 표시 시 박스 오버레이용 비율
-  const previewMaxW = 540
-  const scale = state.imageW > previewMaxW ? previewMaxW / state.imageW : 1
-  const previewW = state.imageW * scale
-  const previewH = state.imageH * scale
-
-  return (
-    <div style={modalBackdropStyle} onClick={onCancel}>
-      <div style={modalContentStyle} onClick={(e) => e.stopPropagation()}>
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-          <h2 style={{ margin: 0, fontSize: 18 }}>Tag {faces.length} face{faces.length === 1 ? '' : 's'}</h2>
-          <button type="button" onClick={onCancel} style={modalCloseStyle}>✕</button>
-        </div>
-        <div style={{ position: 'relative', maxWidth: previewW, marginBottom: 16 }}>
-          <img src={state.imageDataUrl} alt="capture" style={{ width: previewW, height: previewH, borderRadius: 6, display: 'block' }} />
-          {faces.map((f, i) => (
-            <div
-              key={i}
-              style={{
-                position: 'absolute',
-                left: f.box.x * scale,
-                top: f.box.y * scale,
-                width: f.box.width * scale,
-                height: f.box.height * scale,
-                border: `2px solid ${cycleColor(i)}`,
-                borderRadius: 4,
-                boxShadow: '0 0 0 1px rgba(0,0,0,0.5)',
-                pointerEvents: 'none',
-              }}
-            >
-              <span style={{
-                position: 'absolute', top: -22, left: 0,
-                background: cycleColor(i), color: '#000',
-                fontSize: 12, padding: '2px 6px', borderRadius: 3, fontWeight: 700,
-              }}>#{i + 1}</span>
-            </div>
-          ))}
-        </div>
-
-        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-          {faces.map((f, i) => (
-            <CaptureFaceCard
-              key={i}
-              index={i}
-              face={f}
-              existingNames={state.existingNames}
-              onChange={(patch) => patchFace(i, patch)}
-            />
-          ))}
-        </div>
-
-        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 }}>
-          <button type="button" onClick={onCancel} style={modalSecondaryBtnStyle}>Cancel</button>
-          <button
-            type="button"
-            onClick={handleSave}
-            disabled={saving || validAssignments.length === 0}
-            style={modalPrimaryBtnStyle}
-          >
-            {saving ? 'Saving…' : `Save ${validAssignments.length}`}
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function CaptureFaceCard(props: {
-  index: number
-  face: CaptureFaceState
-  existingNames: string[]
-  onChange: (patch: Partial<CaptureFaceState['assignment']>) => void
-}) {
-  const { index, face, existingNames, onChange } = props
-  const color = cycleColor(index)
-  const listId = `existing-names-${index}`
-
-  return (
-    <div style={faceCardStyle(color)}>
-      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6 }}>
-        <span style={{ background: color, color: '#000', padding: '2px 7px', borderRadius: 3, fontWeight: 700, fontSize: 12 }}>#{index + 1}</span>
-        {face.topMatches.length > 0 ? (
-          <span style={{ fontSize: 13 }}>
-            Top match: <b>{face.topMatches[0].name}</b> ({(face.topMatches[0].similarity * 100).toFixed(0)}%)
-            {face.topMatches[1] && (
-              <span style={{ opacity: 0.7 }}>
-                {' '}· {face.topMatches[1].name} ({(face.topMatches[1].similarity * 100).toFixed(0)}%)
-              </span>
-            )}
-          </span>
-        ) : (
-          <span style={{ fontSize: 13, opacity: 0.7 }}>No match in DB</span>
-        )}
-      </div>
-      <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
-        <label style={{ display: 'flex', gap: 5, alignItems: 'center', fontSize: 13 }}>
-          <input
-            type="radio"
-            checked={face.assignment.mode === 'existing'}
-            onChange={() => onChange({ mode: 'existing' })}
-          />
-          Existing
-        </label>
-        <label style={{ display: 'flex', gap: 5, alignItems: 'center', fontSize: 13 }}>
-          <input
-            type="radio"
-            checked={face.assignment.mode === 'new'}
-            onChange={() => onChange({ mode: 'new', name: '' })}
-          />
-          New person
-        </label>
-        <input
-          type="text"
-          list={face.assignment.mode === 'existing' ? listId : undefined}
-          value={face.assignment.name}
-          onChange={(e) => onChange({ name: e.target.value })}
-          placeholder={face.assignment.mode === 'existing' ? 'Select or type existing' : 'New name'}
-          style={modalInputStyle}
-        />
-        <datalist id={listId}>
-          {existingNames.map((n) => <option key={n} value={n} />)}
-        </datalist>
-      </div>
-    </div>
-  )
-}
-
-const MODAL_COLORS = ['#7ee', '#ff7', '#f7f', '#7f7', '#f77', '#77f', '#fa7', '#7fa', '#a7f', '#f7a']
-function cycleColor(i: number): string { return MODAL_COLORS[i % MODAL_COLORS.length] }
-
 function FullscreenButton({ isFullscreen }: { isFullscreen: boolean }) {
   function onClick() {
     if (isFullscreen) document.exitFullscreen().catch(() => {})
@@ -1272,9 +995,8 @@ const statusOverlayStyle: React.CSSProperties = {
   pointerEvents: 'none', maxWidth: 'calc(100vw - 28px)',
 }
 const bottomWrapStyle: React.CSSProperties = {
-  position: 'fixed', left: '50%', bottom: 16, transform: 'translateX(-50%)',
-  zIndex: 10, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 10,
-  maxWidth: 'calc(100vw - 28px)', width: 'max-content',
+  display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 10,
+  maxWidth: 'calc(100vw - 32px)',
   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
   color: '#fff', textShadow: '0 1px 2px rgba(0,0,0,0.85)',
 }
@@ -1306,56 +1028,12 @@ const fabStyle = (open: boolean): React.CSSProperties => ({
   display: 'flex', alignItems: 'center', justifyContent: 'center',
   boxShadow: open ? '0 0 16px rgba(126,238,238,0.5)' : '0 2px 8px rgba(0,0,0,0.5)',
 })
-const modalBackdropStyle: React.CSSProperties = {
-  position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 100,
-  display: 'flex', alignItems: 'center', justifyContent: 'center',
-  padding: 20, overflow: 'auto',
-}
-const modalContentStyle: React.CSSProperties = {
-  background: '#13161a', color: '#e8e8e8',
-  borderRadius: 12, padding: 20, maxWidth: 640, width: '100%',
-  border: '1px solid rgba(255,255,255,0.1)',
-  maxHeight: 'calc(100vh - 40px)', overflow: 'auto',
-  fontFamily: 'ui-sans-serif, system-ui, sans-serif',
-}
-const modalCloseStyle: React.CSSProperties = {
-  background: 'transparent', border: 'none', color: '#aaa',
-  cursor: 'pointer', fontSize: 18, padding: 4,
-}
-const modalInputStyle: React.CSSProperties = {
-  flex: 1, minWidth: 140,
-  background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.25)',
-  color: '#fff', padding: '6px 10px', borderRadius: 5, fontSize: 13, outline: 'none',
-}
-const modalPrimaryBtnStyle: React.CSSProperties = {
-  background: 'rgba(126,238,238,0.18)', border: '1px solid rgba(126,238,238,0.7)',
-  color: '#fff', padding: '8px 16px', borderRadius: 6, cursor: 'pointer', fontSize: 14,
-}
-const modalSecondaryBtnStyle: React.CSSProperties = {
-  background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.25)',
-  color: '#fff', padding: '8px 16px', borderRadius: 6, cursor: 'pointer', fontSize: 14,
-}
-const faceCardStyle = (color: string): React.CSSProperties => ({
-  background: 'rgba(255,255,255,0.04)',
-  border: `1px solid ${color}55`,
-  borderRadius: 8, padding: 12,
-})
-
-const captureBtnStyle = (busy: boolean): React.CSSProperties => ({
-  position: 'fixed', left: 16, bottom: 16, zIndex: 11,
-  width: 52, height: 52, borderRadius: '50%',
-  border: '1px solid rgba(255,255,255,0.45)',
-  background: busy ? 'rgba(255,180,80,0.4)' : 'rgba(0,0,0,0.6)',
-  backdropFilter: 'blur(8px)',
-  color: '#fff', cursor: busy ? 'wait' : 'pointer', padding: 0,
-  display: 'flex', alignItems: 'center', justifyContent: 'center',
-  fontSize: 22,
-  boxShadow: '0 2px 8px rgba(0,0,0,0.5)', transition: 'opacity 200ms',
-})
-
-const fsBtnStyle: React.CSSProperties = {
+const rightClusterStyle: React.CSSProperties = {
   position: 'fixed', right: 16, bottom: 16, zIndex: 11,
-  width: 42, height: 42, borderRadius: '50%',
+  display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 10,
+}
+const fsBtnStyle: React.CSSProperties = {
+  width: 48, height: 48, borderRadius: '50%',
   border: '1px solid rgba(255,255,255,0.4)',
   background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(8px)',
   color: '#fff', cursor: 'pointer', padding: 0,
@@ -1363,21 +1041,16 @@ const fsBtnStyle: React.CSSProperties = {
   boxShadow: '0 2px 8px rgba(0,0,0,0.5)', transition: 'opacity 200ms',
 }
 
-const helpBtnStyle: React.CSSProperties = {
-  position: 'fixed', right: 66, bottom: 16, zIndex: 11,
-  width: 42, height: 42, borderRadius: '50%',
-  border: '1px solid rgba(255,255,255,0.4)',
-  background: 'rgba(0,0,0,0.55)', backdropFilter: 'blur(8px)',
-  color: '#fff', cursor: 'pointer', padding: 0,
+const shutterBtnStyle = (busy: boolean): React.CSSProperties => ({
+  position: 'fixed', left: '50%', bottom: 18, transform: 'translateX(-50%)', zIndex: 11,
+  width: 72, height: 72, borderRadius: '50%',
+  border: '3px solid rgba(255,255,255,0.95)',
+  background: 'rgba(0,0,0,0.35)', backdropFilter: 'blur(8px)',
+  cursor: busy ? 'wait' : 'pointer', padding: 0,
   display: 'flex', alignItems: 'center', justifyContent: 'center',
-  boxShadow: '0 2px 8px rgba(0,0,0,0.5)', transition: 'opacity 200ms',
-  fontSize: 18,
-}
-const helpBadgeStyle: React.CSSProperties = {
-  position: 'absolute', top: -4, right: -4,
-  minWidth: 18, height: 18, padding: '0 5px', borderRadius: 9,
-  background: '#ff5050', color: '#fff', fontSize: 11, fontWeight: 700,
-  display: 'flex', alignItems: 'center', justifyContent: 'center',
-  border: '1px solid rgba(0,0,0,0.4)',
-  fontFamily: 'ui-monospace, monospace',
+  boxShadow: '0 2px 10px rgba(0,0,0,0.55)', transition: 'opacity 200ms',
+})
+const shutterInnerStyle: React.CSSProperties = {
+  width: 56, height: 56, borderRadius: '50%',
+  background: '#fff',
 }

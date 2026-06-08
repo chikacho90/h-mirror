@@ -1,10 +1,16 @@
 import { useEffect, useMemo, useState } from 'react'
-import { deleteEmployee, listEmployees, updateEmployeeName, type Employee } from './lib/supabase'
+import {
+  assignPendingClusterToName, deleteEmployee, deletePendingByIds,
+  listEmployees, listPendingCapturesWithEmbedding, updateEmployeeName,
+  type Employee, type PendingCaptureWithEmbedding,
+} from './lib/supabase'
 
 type PersonGroup = { name: string; items: Employee[] }
+const CLUSTER_DIST_THRESHOLD = 0.5  // 같은 사람으로 묶을 임베딩 거리 한계
 
 export function AdminView() {
   const [employees, setEmployees] = useState<Employee[]>([])
+  const [pending, setPending] = useState<PendingCaptureWithEmbedding[]>([])
   const [loading, setLoading] = useState(true)
   const [filter, setFilter] = useState('')
   const [message, setMessage] = useState<{ text: string; ok: boolean } | null>(null)
@@ -16,8 +22,9 @@ export function AdminView() {
   async function refresh() {
     setLoading(true)
     try {
-      const list = await listEmployees()
+      const [list, pend] = await Promise.all([listEmployees(), listPendingCapturesWithEmbedding()])
       setEmployees(list)
+      setPending(pend)
     } catch (e) {
       setMessage({ text: `Load failed: ${e instanceof Error ? e.message : String(e)}`, ok: false })
     } finally {
@@ -42,6 +49,34 @@ export function AdminView() {
   }, [employees, filter])
 
   const allNames = useMemo(() => Array.from(new Set(employees.map((e) => e.name))).sort(), [employees])
+
+  const pendingClusters = useMemo(() => clusterByEmbedding(pending, CLUSTER_DIST_THRESHOLD), [pending])
+
+  async function handleAssignCluster(cluster: PendingCaptureWithEmbedding[], name: string) {
+    if (!name.trim() || cluster.length === 0) return
+    try {
+      await assignPendingClusterToName({
+        ids: cluster.map((c) => c.id),
+        embeddings: cluster.map((c) => c.embedding),
+        image_datas: cluster.map((c) => c.image_data),
+        name: name.trim(),
+      })
+      setMessage({ text: `${cluster.length}장을 "${name.trim()}"의 사진으로 추가`, ok: true })
+      await refresh()
+    } catch (e) {
+      setMessage({ text: `Assign failed: ${e instanceof Error ? e.message : String(e)}`, ok: false })
+    }
+  }
+
+  async function handleDeleteCluster(cluster: PendingCaptureWithEmbedding[]) {
+    if (!confirm(`이 그룹 ${cluster.length}장을 삭제할까요?`)) return
+    try {
+      await deletePendingByIds(cluster.map((c) => c.id))
+      await refresh()
+    } catch (e) {
+      setMessage({ text: `Delete failed: ${e instanceof Error ? e.message : String(e)}`, ok: false })
+    }
+  }
 
   async function handleReassign(rowId: string, newName: string) {
     if (!newName.trim()) return
@@ -108,6 +143,30 @@ export function AdminView() {
         <div style={cardStyle}>Loading…</div>
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: 16, maxWidth: 1080, margin: '0 auto' }}>
+          {pendingClusters.length > 0 && (
+            <section style={personCardStyle}>
+              <div style={personHeaderStyle}>
+                <div>
+                  <div style={{ fontSize: 18, fontWeight: 700 }}>🆕 새 얼굴 후보</div>
+                  <div style={mutedStyle}>
+                    {pending.length}장 · {pendingClusters.length}그룹 (유사도로 자동 묶임)
+                  </div>
+                </div>
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+                {pendingClusters.map((cluster, idx) => (
+                  <ClusterCard
+                    key={cluster[0].id}
+                    cluster={cluster}
+                    index={idx}
+                    allNames={allNames}
+                    onAssign={(name) => handleAssignCluster(cluster, name)}
+                    onDelete={() => handleDeleteCluster(cluster)}
+                  />
+                ))}
+              </div>
+            </section>
+          )}
           {grouped.map((g) => (
             <section key={g.name} style={personCardStyle}>
               <div style={personHeaderStyle}>
@@ -204,6 +263,139 @@ function PhotoCard(props: {
       )}
     </div>
   )
+}
+
+// 단일-링크 클러스터링: Euclidean distance < threshold면 같은 사람으로 묶음
+function clusterByEmbedding(
+  items: PendingCaptureWithEmbedding[],
+  threshold: number,
+): PendingCaptureWithEmbedding[][] {
+  const n = items.length
+  if (n === 0) return []
+  const parent = Array.from({ length: n }, (_, i) => i)
+  const find = (i: number): number => {
+    let r = i
+    while (parent[r] !== r) r = parent[r]
+    while (parent[i] !== r) { const p = parent[i]; parent[i] = r; i = p }
+    return r
+  }
+  const union = (a: number, b: number) => {
+    const ra = find(a), rb = find(b)
+    if (ra !== rb) parent[ra] = rb
+  }
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      const ea = items[i].embedding, eb = items[j].embedding
+      let s = 0
+      for (let k = 0; k < ea.length; k++) { const d = ea[k] - eb[k]; s += d * d }
+      if (Math.sqrt(s) <= threshold) union(i, j)
+    }
+  }
+  const groups = new Map<number, number[]>()
+  for (let i = 0; i < n; i++) {
+    const r = find(i)
+    const arr = groups.get(r) || []
+    arr.push(i)
+    groups.set(r, arr)
+  }
+  return Array.from(groups.values())
+    .sort((a, b) => b.length - a.length)
+    .map((arr) => arr.map((idx) => items[idx]))
+}
+
+function ClusterCard(props: {
+  cluster: PendingCaptureWithEmbedding[]
+  index: number
+  allNames: string[]
+  onAssign: (name: string) => void
+  onDelete: () => void
+}) {
+  const { cluster, index, allNames, onAssign, onDelete } = props
+  const [mode, setMode] = useState<'closed' | 'assign'>('closed')
+  const [draft, setDraft] = useState('')
+
+  // 클러스터의 자동 태그 힌트 — 가장 자주 나온 auto_top_name
+  const hint = useMemo(() => {
+    const tally = new Map<string, number>()
+    for (const c of cluster) {
+      if (c.auto_top_name) tally.set(c.auto_top_name, (tally.get(c.auto_top_name) || 0) + 1)
+    }
+    if (tally.size === 0) return null
+    return Array.from(tally.entries()).sort((a, b) => b[1] - a[1])[0][0]
+  }, [cluster])
+
+  const listId = `cluster-names-${index}`
+
+  return (
+    <div style={clusterCardStyle}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+        <div style={{ fontSize: 14, fontWeight: 600 }}>
+          그룹 #{index + 1} · {cluster.length}장 {hint && <span style={mutedStyle}>(추정: {hint})</span>}
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          {mode === 'closed' ? (
+            <>
+              {hint && (
+                <button type="button" onClick={() => onAssign(hint)} style={hintBtnStyle}>
+                  ✓ {hint}에 추가
+                </button>
+              )}
+              <button type="button" onClick={() => { setMode('assign'); setDraft('') }} style={editBtnStyle}>
+                ✎ 다른 사람
+              </button>
+              <button type="button" onClick={onDelete} style={deleteMicroBtnStyle}>삭제</button>
+            </>
+          ) : (
+            <>
+              <input
+                type="text"
+                autoFocus
+                list={listId}
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                placeholder="이름 (기존/신규)"
+                style={inlineInputStyle}
+                onKeyDown={(e) => { if (e.key === 'Enter' && draft.trim()) onAssign(draft) }}
+              />
+              <datalist id={listId}>
+                {allNames.map((n) => <option key={n} value={n} />)}
+              </datalist>
+              <button type="button" onClick={() => onAssign(draft)} disabled={!draft.trim()} style={confirmBtnStyle}>저장</button>
+              <button type="button" onClick={() => setMode('closed')} style={cancelMicroBtnStyle}>취소</button>
+            </>
+          )}
+        </div>
+      </div>
+      <div style={clusterThumbsStyle}>
+        {cluster.slice(0, 20).map((c) => (
+          <img key={c.id} src={c.image_data} alt="" style={clusterThumbStyle} />
+        ))}
+        {cluster.length > 20 && (
+          <div style={{ ...mutedStyle, alignSelf: 'center' }}>+{cluster.length - 20}</div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+const clusterCardStyle: React.CSSProperties = {
+  background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,200,80,0.3)',
+  borderRadius: 8, padding: 12,
+}
+const clusterThumbsStyle: React.CSSProperties = {
+  display: 'flex', flexWrap: 'wrap', gap: 4,
+}
+const clusterThumbStyle: React.CSSProperties = {
+  width: 64, height: 64, objectFit: 'cover', borderRadius: 4, background: '#000',
+}
+const hintBtnStyle: React.CSSProperties = {
+  background: 'rgba(126,238,238,0.18)', border: '1px solid rgba(126,238,238,0.7)',
+  color: '#fff', padding: '4px 10px', borderRadius: 5, fontSize: 12, cursor: 'pointer',
+}
+const inlineInputStyle: React.CSSProperties = {
+  background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.25)',
+  color: '#fff', padding: '4px 8px', borderRadius: 4, fontSize: 12, outline: 'none',
+  minWidth: 140,
 }
 
 const pageStyle: React.CSSProperties = {
