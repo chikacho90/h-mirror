@@ -99,6 +99,9 @@ function RecognizeView() {
   const faceProcessingRef = useRef(false)
   const lastFaceRunAtRef = useRef(0)
   const [faceReady, setFaceReady] = useState(false)
+  // closure 안에서 최신 값 읽기 위한 ref (state는 init useEffect에서 false로 캡쳐됨)
+  const faceReadyRef = useRef(false)
+  useEffect(() => { faceReadyRef.current = faceReady }, [faceReady])
 
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout> | null = null
@@ -314,7 +317,7 @@ function RecognizeView() {
     }
 
     // 얼굴 인식 — 트랙이 있고 충분히 시간이 지났을 때만 (전체 프레임에서 얼굴 검출 + 임베딩 + DB 매칭)
-    if (faceReady && tracksRef.current.length > 0 &&
+    if (faceReadyRef.current && tracksRef.current.length > 0 &&
         !faceProcessingRef.current &&
         ts - lastFaceRunAtRef.current >= FACE_REFRESH_MS) {
       lastFaceRunAtRef.current = ts
