@@ -26,7 +26,7 @@ export async function extractSingleEmbedding(source: Source): Promise<{
 } | null> {
   await loadFaceModels()
   const result = await faceapi
-    .detectSingleFace(source as faceapi.TNetInput, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 }))
+    .detectSingleFace(source as faceapi.TNetInput, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.4 }))
     .withFaceLandmarks()
     .withFaceDescriptor()
   if (!result) return null
@@ -40,7 +40,7 @@ export async function extractAllEmbeddings(source: Source): Promise<Array<{
 }>> {
   await loadFaceModels()
   const results = await faceapi
-    .detectAllFaces(source as faceapi.TNetInput, new faceapi.TinyFaceDetectorOptions({ inputSize: 320, scoreThreshold: 0.5 }))
+    .detectAllFaces(source as faceapi.TNetInput, new faceapi.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.4 }))
     .withFaceLandmarks()
     .withFaceDescriptors()
   return results.map((r) => {

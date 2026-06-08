@@ -34,8 +34,8 @@ const DISPLAY_TOP_N = 3            // 한 줄에 top-3 (1위 강조)
 // 자동 캡쳐 — 메인페이지에 지나가는 사람들을 자동 분류 (높음=직접 추가 / 낮음=admin 후보 풀)
 const AUTO_CAPTURE_MIN_TRACK_AGE_MS = 1500   // 트랙이 안정될 때까지 기다림
 const AUTO_CAPTURE_COOLDOWN_MS = 30000       // 같은 트랙은 30초마다 1장만
-const AUTO_CAPTURE_MIN_FACE_PX = 56          // 너무 작은 얼굴 (먼 거리) 스킵
-const AUTO_CAPTURE_HIGH_CONF = 0.6           // 이 이상은 자동으로 해당 인물 풀에 추가
+const AUTO_CAPTURE_MIN_FACE_PX = 40          // 너무 작은 얼굴 (먼 거리) 스킵 — 저화질 카메라 고려해 낮춤
+const AUTO_CAPTURE_HIGH_CONF = 0.55          // 이 이상은 자동으로 해당 인물 풀에 추가
 
 type Status = 'idle' | 'loading-model' | 'requesting-camera' | 'running' | 'error'
 type BBox = { x: number; y: number; w: number; h: number }
@@ -211,8 +211,8 @@ function RecognizeView() {
       try {
         setStatus((s) => (s === 'error' ? s : s === 'running' ? s : 'requesting-camera'))
         const videoConstraint: MediaTrackConstraints = {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
+          width: { ideal: 1920 },     // FHD 우선, 안되면 브라우저가 fallback
+          height: { ideal: 1080 },
           frameRate: { ideal: 60 },
         }
         if (cameraDeviceId) videoConstraint.deviceId = { exact: cameraDeviceId }
