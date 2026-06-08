@@ -570,12 +570,17 @@ function drawIdentityLabel(
   const color = colorForId(t.id)
 
   // 매칭 결과 줄들 구성 — 넘버 제거, 이름만 (또는 검색/없음)
+  // 같은 사람의 다른 임베딩이 top-K에 여러 개 들어올 수 있으므로 이름 기준 dedupe
   const lines: string[] = []
   if (t.matches.length === 0) {
     lines.push(t.lastFaceProcessedAt === 0 ? 'Searching…' : 'Unknown')
   } else {
-    const top = t.matches[0]
-    const second = t.matches[1]
+    const dedup: { name: string; similarity: number }[] = []
+    for (const m of t.matches) {
+      if (!dedup.find((d) => d.name === m.name)) dedup.push(m)
+    }
+    const top = dedup[0]
+    const second = dedup[1]
     const topPct = (top.similarity * 100).toFixed(0)
     const ambiguous = second && (top.similarity - second.similarity) < 0.10
     lines.push(`${top.name} (${topPct}%)`)
