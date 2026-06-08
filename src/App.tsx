@@ -8,7 +8,7 @@ import {
 } from '@mediapipe/tasks-vision'
 import { EnrollView } from './EnrollView'
 import { extractAllEmbeddings, loadFaceModels } from './lib/faceApi'
-import { matchFace, type MatchResult } from './lib/supabase'
+import { insertEmployee, listEmployeeNames, matchFace, type MatchResult } from './lib/supabase'
 
 const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm'
 const OBJ_MODEL = 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite'
@@ -78,6 +78,8 @@ function RecognizeView() {
   const [fsUiVisible, setFsUiVisible] = useState(true)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [cameras, setCameras] = useState<MediaDeviceInfo[]>([])
+  const [captureModal, setCaptureModal] = useState<CaptureModalState | null>(null)
+  const [capturing, setCapturing] = useState(false)
   const [cameraDeviceId, setCameraDeviceId] = useState<string | null>(null)
 
   const mirrorRef = useRef(true)
@@ -359,8 +361,85 @@ function RecognizeView() {
       />
 
       {fsUiVisible && (<FullscreenButton isFullscreen={isFullscreen} />)}
+
+      {/* 좌하단 캡쳐 버튼 — 현재 프레임 잡아서 인물 태깅 모달 띄움 */}
+      {fsUiVisible && (
+        <button
+          type="button"
+          onClick={handleCapture}
+          disabled={!faceReady || capturing}
+          title="Capture & tag faces"
+          style={captureBtnStyle(capturing)}
+        >
+          {capturing ? '…' : '📸'}
+        </button>
+      )}
+
+      {captureModal && (
+        <CaptureTagModal
+          state={captureModal}
+          onCancel={() => setCaptureModal(null)}
+          onSave={async (assignments) => {
+            for (const a of assignments) {
+              await insertEmployee(a.name, Array.from(a.descriptor), `webcam-${new Date().toISOString()}`)
+            }
+            setCaptureModal(null)
+          }}
+        />
+      )}
     </div>
   )
+
+  async function handleCapture() {
+    if (capturing) return
+    const video = videoRef.current
+    if (!video || video.readyState < 2) return
+    setCapturing(true)
+    try {
+      const cap = document.createElement('canvas')
+      cap.width = video.videoWidth
+      cap.height = video.videoHeight
+      const ctx = cap.getContext('2d')!
+      if (mirrorRef.current) {
+        ctx.translate(cap.width, 0)
+        ctx.scale(-1, 1)
+      }
+      ctx.drawImage(video, 0, 0)
+      ctx.setTransform(1, 0, 0, 1, 0, 0)
+
+      const faces = await extractAllEmbeddings(cap)
+      if (faces.length === 0) {
+        alert('No faces detected in the captured frame.')
+        return
+      }
+      const existingNames = await listEmployeeNames()
+      const detected: CaptureFaceState[] = []
+      for (const f of faces) {
+        let topMatches: MatchResult[] = []
+        try { topMatches = await matchFace(Array.from(f.descriptor), 3, 0.2) } catch { /* skip */ }
+        detected.push({
+          box: f.box,
+          descriptor: f.descriptor,
+          topMatches,
+          assignment: {
+            name: topMatches[0]?.name ?? '',
+            mode: topMatches.length > 0 ? 'existing' : 'new',
+          },
+        })
+      }
+      setCaptureModal({
+        imageDataUrl: cap.toDataURL('image/jpeg', 0.85),
+        imageW: cap.width,
+        imageH: cap.height,
+        faces: detected,
+        existingNames,
+      })
+    } catch (e) {
+      alert(`Capture failed: ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setCapturing(false)
+    }
+  }
 }
 
 function updateTracks(
@@ -819,6 +898,179 @@ function targetLabel(t: TargetMode): string {
   return ({ 'none': 'None', 'full-body': 'Full body', 'face': 'Face' } as const)[t]
 }
 
+// ─── 캡쳐 모달 — 잡은 프레임에서 인물 태깅 ─────────────
+
+type CaptureFaceState = {
+  box: { x: number; y: number; width: number; height: number }
+  descriptor: Float32Array
+  topMatches: MatchResult[]
+  assignment: { name: string; mode: 'existing' | 'new' }
+}
+type CaptureModalState = {
+  imageDataUrl: string
+  imageW: number
+  imageH: number
+  faces: CaptureFaceState[]
+  existingNames: string[]
+}
+
+function CaptureTagModal(props: {
+  state: CaptureModalState
+  onCancel: () => void
+  onSave: (assignments: Array<{ name: string; descriptor: Float32Array }>) => Promise<void>
+}) {
+  const { state, onCancel, onSave } = props
+  const [faces, setFaces] = useState<CaptureFaceState[]>(state.faces)
+  const [saving, setSaving] = useState(false)
+
+  function patchFace(idx: number, patch: Partial<CaptureFaceState['assignment']>) {
+    setFaces((prev) => prev.map((f, i) => (i === idx ? { ...f, assignment: { ...f.assignment, ...patch } } : f)))
+  }
+
+  const validAssignments = faces.filter((f) => f.assignment.name.trim())
+
+  async function handleSave() {
+    if (validAssignments.length === 0) return
+    setSaving(true)
+    try {
+      await onSave(validAssignments.map((f) => ({ name: f.assignment.name.trim(), descriptor: f.descriptor })))
+    } catch (e) {
+      alert(`Save failed: ${e instanceof Error ? e.message : String(e)}`)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  // 이미지 표시 시 박스 오버레이용 비율
+  const previewMaxW = 540
+  const scale = state.imageW > previewMaxW ? previewMaxW / state.imageW : 1
+  const previewW = state.imageW * scale
+  const previewH = state.imageH * scale
+
+  return (
+    <div style={modalBackdropStyle} onClick={onCancel}>
+      <div style={modalContentStyle} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+          <h2 style={{ margin: 0, fontSize: 18 }}>Tag {faces.length} face{faces.length === 1 ? '' : 's'}</h2>
+          <button type="button" onClick={onCancel} style={modalCloseStyle}>✕</button>
+        </div>
+        <div style={{ position: 'relative', maxWidth: previewW, marginBottom: 16 }}>
+          <img src={state.imageDataUrl} alt="capture" style={{ width: previewW, height: previewH, borderRadius: 6, display: 'block' }} />
+          {faces.map((f, i) => (
+            <div
+              key={i}
+              style={{
+                position: 'absolute',
+                left: f.box.x * scale,
+                top: f.box.y * scale,
+                width: f.box.width * scale,
+                height: f.box.height * scale,
+                border: `2px solid ${cycleColor(i)}`,
+                borderRadius: 4,
+                boxShadow: '0 0 0 1px rgba(0,0,0,0.5)',
+                pointerEvents: 'none',
+              }}
+            >
+              <span style={{
+                position: 'absolute', top: -22, left: 0,
+                background: cycleColor(i), color: '#000',
+                fontSize: 12, padding: '2px 6px', borderRadius: 3, fontWeight: 700,
+              }}>#{i + 1}</span>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          {faces.map((f, i) => (
+            <CaptureFaceCard
+              key={i}
+              index={i}
+              face={f}
+              existingNames={state.existingNames}
+              onChange={(patch) => patchFace(i, patch)}
+            />
+          ))}
+        </div>
+
+        <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end', marginTop: 16 }}>
+          <button type="button" onClick={onCancel} style={modalSecondaryBtnStyle}>Cancel</button>
+          <button
+            type="button"
+            onClick={handleSave}
+            disabled={saving || validAssignments.length === 0}
+            style={modalPrimaryBtnStyle}
+          >
+            {saving ? 'Saving…' : `Save ${validAssignments.length}`}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function CaptureFaceCard(props: {
+  index: number
+  face: CaptureFaceState
+  existingNames: string[]
+  onChange: (patch: Partial<CaptureFaceState['assignment']>) => void
+}) {
+  const { index, face, existingNames, onChange } = props
+  const color = cycleColor(index)
+  const listId = `existing-names-${index}`
+
+  return (
+    <div style={faceCardStyle(color)}>
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', marginBottom: 6 }}>
+        <span style={{ background: color, color: '#000', padding: '2px 7px', borderRadius: 3, fontWeight: 700, fontSize: 12 }}>#{index + 1}</span>
+        {face.topMatches.length > 0 ? (
+          <span style={{ fontSize: 13 }}>
+            Top match: <b>{face.topMatches[0].name}</b> ({(face.topMatches[0].similarity * 100).toFixed(0)}%)
+            {face.topMatches[1] && (
+              <span style={{ opacity: 0.7 }}>
+                {' '}· {face.topMatches[1].name} ({(face.topMatches[1].similarity * 100).toFixed(0)}%)
+              </span>
+            )}
+          </span>
+        ) : (
+          <span style={{ fontSize: 13, opacity: 0.7 }}>No match in DB</span>
+        )}
+      </div>
+      <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+        <label style={{ display: 'flex', gap: 5, alignItems: 'center', fontSize: 13 }}>
+          <input
+            type="radio"
+            checked={face.assignment.mode === 'existing'}
+            onChange={() => onChange({ mode: 'existing' })}
+          />
+          Existing
+        </label>
+        <label style={{ display: 'flex', gap: 5, alignItems: 'center', fontSize: 13 }}>
+          <input
+            type="radio"
+            checked={face.assignment.mode === 'new'}
+            onChange={() => onChange({ mode: 'new', name: '' })}
+          />
+          New person
+        </label>
+        <input
+          type="text"
+          list={face.assignment.mode === 'existing' ? listId : undefined}
+          value={face.assignment.name}
+          onChange={(e) => onChange({ name: e.target.value })}
+          placeholder={face.assignment.mode === 'existing' ? 'Select or type existing' : 'New name'}
+          style={modalInputStyle}
+        />
+        <datalist id={listId}>
+          {existingNames.map((n) => <option key={n} value={n} />)}
+        </datalist>
+      </div>
+    </div>
+  )
+}
+
+const MODAL_COLORS = ['#7ee', '#ff7', '#f7f', '#7f7', '#f77', '#77f', '#fa7', '#7fa', '#a7f', '#f7a']
+function cycleColor(i: number): string { return MODAL_COLORS[i % MODAL_COLORS.length] }
+
 function FullscreenButton({ isFullscreen }: { isFullscreen: boolean }) {
   function onClick() {
     if (isFullscreen) document.exitFullscreen().catch(() => {})
@@ -928,6 +1180,53 @@ const enrollLinkStyle: React.CSSProperties = {
   fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
   textShadow: '0 1px 2px rgba(0,0,0,0.85)',
 }
+const modalBackdropStyle: React.CSSProperties = {
+  position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.7)', zIndex: 100,
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+  padding: 20, overflow: 'auto',
+}
+const modalContentStyle: React.CSSProperties = {
+  background: '#13161a', color: '#e8e8e8',
+  borderRadius: 12, padding: 20, maxWidth: 640, width: '100%',
+  border: '1px solid rgba(255,255,255,0.1)',
+  maxHeight: 'calc(100vh - 40px)', overflow: 'auto',
+  fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+}
+const modalCloseStyle: React.CSSProperties = {
+  background: 'transparent', border: 'none', color: '#aaa',
+  cursor: 'pointer', fontSize: 18, padding: 4,
+}
+const modalInputStyle: React.CSSProperties = {
+  flex: 1, minWidth: 140,
+  background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.25)',
+  color: '#fff', padding: '6px 10px', borderRadius: 5, fontSize: 13, outline: 'none',
+}
+const modalPrimaryBtnStyle: React.CSSProperties = {
+  background: 'rgba(126,238,238,0.18)', border: '1px solid rgba(126,238,238,0.7)',
+  color: '#fff', padding: '8px 16px', borderRadius: 6, cursor: 'pointer', fontSize: 14,
+}
+const modalSecondaryBtnStyle: React.CSSProperties = {
+  background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.25)',
+  color: '#fff', padding: '8px 16px', borderRadius: 6, cursor: 'pointer', fontSize: 14,
+}
+const faceCardStyle = (color: string): React.CSSProperties => ({
+  background: 'rgba(255,255,255,0.04)',
+  border: `1px solid ${color}55`,
+  borderRadius: 8, padding: 12,
+})
+
+const captureBtnStyle = (busy: boolean): React.CSSProperties => ({
+  position: 'fixed', left: 16, bottom: 16, zIndex: 11,
+  width: 52, height: 52, borderRadius: '50%',
+  border: '1px solid rgba(255,255,255,0.45)',
+  background: busy ? 'rgba(255,180,80,0.4)' : 'rgba(0,0,0,0.6)',
+  backdropFilter: 'blur(8px)',
+  color: '#fff', cursor: busy ? 'wait' : 'pointer', padding: 0,
+  display: 'flex', alignItems: 'center', justifyContent: 'center',
+  fontSize: 22,
+  boxShadow: '0 2px 8px rgba(0,0,0,0.5)', transition: 'opacity 200ms',
+})
+
 const fsBtnStyle: React.CSSProperties = {
   position: 'fixed', right: 16, bottom: 16, zIndex: 11,
   width: 42, height: 42, borderRadius: '50%',

@@ -32,6 +32,16 @@ export async function listEmployees(): Promise<Employee[]> {
   return data ?? []
 }
 
+export async function listEmployeeNames(): Promise<string[]> {
+  const { data, error } = await supabase
+    .from('employees')
+    .select('name')
+  if (error) throw error
+  const set = new Set<string>()
+  for (const row of data ?? []) set.add((row as { name: string }).name)
+  return Array.from(set).sort()
+}
+
 export async function insertEmployee(name: string, embedding: number[], notes?: string) {
   const { error } = await supabase
     .from('employees')
