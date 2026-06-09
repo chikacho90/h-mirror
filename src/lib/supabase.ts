@@ -133,8 +133,18 @@ export async function insertEmployee(name: string, embedding: number[], notes?: 
   if (error) throw error
 }
 
-// 인물별 사진 cap. 새 사진 들어올 때 max 초과면 새 임베딩과 "가장 비슷한" 기존 row 삭제 → 다양성 유지.
-const MAX_PHOTOS_PER_PERSON = 50
+// 인물별 임베딩 상한. 다양한 카메라/각도/조명 커버리지를 최대화하기 위해
+// 꽉 차면 (기존+신규) 중 "가장 중복된(최근접 이웃이 제일 가까운)" 하나를 제거해
+// 남는 셋이 최대한 넓게 퍼지도록 유지한다. 신규가 가장 중복이면 추가하지 않음.
+const MAX_PHOTOS_PER_PERSON = 30
+
+function euclid(a: number[], b: number[]): number {
+  let s = 0
+  const n = Math.min(a.length, b.length)
+  for (let i = 0; i < n; i++) { const d = a[i] - b[i]; s += d * d }
+  return Math.sqrt(s)
+}
+
 export async function insertEmployeeWithDiversityCap(args: {
   name: string
   embedding: number[]
@@ -146,20 +156,42 @@ export async function insertEmployeeWithDiversityCap(args: {
     .from('employees').select('id,embedding').eq('name', name)
   if (e1) throw e1
   const rows = (existing ?? []) as Array<{ id: string; embedding: unknown }>
-  if (rows.length >= MAX_PHOTOS_PER_PERSON) {
-    let worstId: string | null = null
-    let worstDist = Infinity
-    for (const r of rows) {
-      const emb = parseEmbedding(r.embedding)
-      if (!emb) continue
-      let s = 0
-      for (let i = 0; i < emb.length; i++) { const d = emb[i] - embedding[i]; s += d * d }
-      const dist = Math.sqrt(s)
-      if (dist < worstDist) { worstDist = dist; worstId = r.id }
-    }
-    if (worstId) await supabase.from('employees').delete().eq('id', worstId)
+
+  if (rows.length < MAX_PHOTOS_PER_PERSON) {
+    await insertEmployee(name, embedding, notes, image_data)
+    return
   }
-  await insertEmployee(name, embedding, notes, image_data)
+
+  // 풀이 가득(또는 초과) — 기존(파싱 가능분)+신규를 한 집합으로 두고
+  // CAP 이하가 될 때까지 "최근접 이웃 거리가 가장 작은(가장 중복된)" 점부터 greedy 제거.
+  const NEW = '__new__'
+  const parsed: Array<{ id: string; emb: number[] }> = []
+  for (const r of rows) { const e = parseEmbedding(r.embedding); if (e) parsed.push({ id: r.id, emb: e }) }
+  const pts = [...parsed, { id: NEW, emb: embedding }]
+
+  while (pts.length > MAX_PHOTOS_PER_PERSON) {
+    let idx = -1, smallestNN = Infinity
+    for (let i = 0; i < pts.length; i++) {
+      let nn = Infinity
+      for (let j = 0; j < pts.length; j++) {
+        if (i === j) continue
+        const d = euclid(pts[i].emb, pts[j].emb)
+        if (d < nn) nn = d
+      }
+      if (nn < smallestNN) { smallestNN = nn; idx = i }
+    }
+    if (idx < 0) break
+    pts.splice(idx, 1)
+  }
+
+  const keptIds = new Set(pts.map((p) => p.id))
+  const toDelete = parsed.filter((p) => !keptIds.has(p.id)).map((p) => p.id)
+  if (toDelete.length > 0) {
+    const { error: e2 } = await supabase.from('employees').delete().in('id', toDelete)
+    if (e2) throw e2
+  }
+  if (keptIds.has(NEW)) await insertEmployee(name, embedding, notes, image_data)
+  // 신규가 가장 중복이라 탈락하면 저장 안 함
 }
 
 function parseEmbedding(raw: unknown): number[] | null {
