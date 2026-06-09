@@ -34,11 +34,14 @@ const MATCH_TOP_K = 10             // dedupe/융합 여유 위해 여러 개 가
 const IDENTITY_WINDOW_MS = 8000    // 최근 관측 유지 시간 (이 안의 매칭들로 신원 결정)
 const IDENTITY_MIN_OBS = 2         // 신원 확정에 필요한 최소 관측 수
 const IDENTITY_MIN_SIM = 0.50      // 평균 유사도 이 미만이면 'Unknown' (낯선 사람 오인식 방지)
+const IDENTITY_MIN_MARGIN = 0.06   // 1등이 2등 인물보다 이만큼 못 앞서면 모호 → 'Unknown'
 // 자동 캡쳐 — 메인페이지에 지나가는 사람들을 자동 분류 (높음=직접 추가 / 낮음=admin 후보 풀)
 const AUTO_CAPTURE_MIN_TRACK_AGE_MS = 1500   // 트랙이 안정될 때까지 기다림
 const AUTO_CAPTURE_COOLDOWN_MS = 30000       // 같은 트랙은 30초마다 1장만
 const AUTO_CAPTURE_MIN_FACE_PX = 40          // 너무 작은 얼굴 (먼 거리) 스킵 — 저화질 카메라 고려해 낮춤
-const AUTO_CAPTURE_HIGH_CONF = 0.55          // 이 이상은 자동으로 해당 인물 풀에 추가
+// 자동 추가는 "진짜 확신"일 때만 — 아래 둘 다 충족해야 인물 풀에 직접 추가, 아니면 pending(새 얼굴 후보)
+const AUTO_CAPTURE_HIGH_CONF = 0.70          // 융합 평균 유사도 임계 (이 미만이면 자동추가 안 함)
+const AUTO_CAPTURE_MIN_MARGIN = 0.12         // 1등이 2등 인물보다 이만큼 앞서야 (오귀속 방지)
 
 type Status = 'idle' | 'loading-model' | 'requesting-camera' | 'running' | 'error'
 type BBox = { x: number; y: number; w: number; h: number }
@@ -48,10 +51,10 @@ type TargetMode = 'none' | 'full-body' | 'face'
 const DISPLAY_OPTIONS: ShapeMode[] = ['box', 'silhouette-bg', 'silhouette-fg', 'silhouette-outline']
 const TARGET_OPTIONS: TargetMode[] = ['full-body', 'face']
 
-// 한 프레임의 얼굴 매칭 관측 1건
-type IdObs = { name: string; id: string; sim: number; t: number }
+// 한 프레임의 얼굴 매칭 관측 1건 (margin = 1등 - 2등인물 유사도)
+type IdObs = { name: string; id: string; sim: number; margin: number; t: number }
 // 융합으로 확정된 신원 (트랙에 sticky 하게 유지)
-type Identity = { name: string; id: string; confidence: number }
+type Identity = { name: string; id: string; confidence: number; margin: number }
 type Track = {
   id: number
   bbox: BBox
@@ -550,7 +553,10 @@ async function processFaceMatching(
         const results = await matchFace(Array.from(detection.descriptor), MATCH_TOP_K, MATCH_THRESHOLD)
         if (results.length > 0) {
           const top = results[0]
-          track.obs.push({ name: top.name, id: top.id, sim: top.similarity, t: performance.now() })
+          // 2등은 "다른 인물"의 최고 유사도 — 동명 중복 행은 제외
+          const second = results.find((r) => r.name !== top.name)
+          const margin = top.similarity - (second?.similarity ?? 0)
+          track.obs.push({ name: top.name, id: top.id, sim: top.similarity, margin, t: performance.now() })
         }
         track.lastFaceProcessedAt = performance.now()
       } catch {
@@ -571,11 +577,12 @@ async function processFaceMatching(
         autoCfg.cooldown.set(track.id, now)
         const thumb = cropFaceThumb(video, originalBox)
         const id = track.identity
-        // fire-and-forget — UI 안 막음. autoCapture가 신뢰도 보고 직접추가/pending 분기
+        // 직접 추가는 "진짜 확신"일 때만: 융합 유사도 높음 + 2등 대비 마진 충분. 아니면 topMatch=null → pending.
+        const confident = !!id && id.confidence >= AUTO_CAPTURE_HIGH_CONF && id.margin >= AUTO_CAPTURE_MIN_MARGIN
         autoCapture({
           embedding: Array.from(detection.descriptor),
           image_data: thumb,
-          topMatch: id ? { name: id.name, similarity: id.confidence } : null,
+          topMatch: confident ? { name: id!.name, similarity: id!.confidence } : null,
           highConfThreshold: AUTO_CAPTURE_HIGH_CONF,
         }).catch(() => { /* skip */ })
       }
@@ -589,16 +596,20 @@ async function processFaceMatching(
 function resolveIdentity(track: Track, now: number) {
   track.obs = track.obs.filter((o) => now - o.t <= IDENTITY_WINDOW_MS)
   if (track.obs.length === 0) return // 관측 없음 → 직전 신원 유지
-  const agg = new Map<string, { name: string; id: string; score: number; n: number }>()
+  const agg = new Map<string, { name: string; id: string; score: number; marginSum: number; n: number }>()
   for (const o of track.obs) {
-    const a = agg.get(o.name) ?? { name: o.name, id: o.id, score: 0, n: 0 }
-    a.score += o.sim; a.n += 1
+    const a = agg.get(o.name) ?? { name: o.name, id: o.id, score: 0, marginSum: 0, n: 0 }
+    a.score += o.sim; a.marginSum += o.margin; a.n += 1
     agg.set(o.name, a)
   }
-  let best: { name: string; id: string; score: number; n: number } | null = null
+  let best: { name: string; id: string; score: number; marginSum: number; n: number } | null = null
   for (const a of agg.values()) if (!best || a.score > best.score) best = a
-  if (best && best.n >= IDENTITY_MIN_OBS && best.score / best.n >= IDENTITY_MIN_SIM) {
-    track.identity = { name: best.name, id: best.id, confidence: best.score / best.n }
+  if (!best) return
+  const avgSim = best.score / best.n
+  const avgMargin = best.marginSum / best.n
+  // 확정 조건: 관측 충분 + 평균 유사도 + 2등 대비 마진. 모호하면 기존 신원 유지(없으면 Unknown).
+  if (best.n >= IDENTITY_MIN_OBS && avgSim >= IDENTITY_MIN_SIM && avgMargin >= IDENTITY_MIN_MARGIN) {
+    track.identity = { name: best.name, id: best.id, confidence: avgSim, margin: avgMargin }
   }
   // 근거 부족 시 track.identity는 그대로 유지(이전 확정값) — 깜빡임 방지
 }
