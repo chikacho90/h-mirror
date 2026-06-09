@@ -26,3 +26,7 @@ dist-ssr
 # env
 .env.local
 .vercel
+
+# flex-sync: 로그인 세션 프로필(쿠키 포함) · 디버그 산출물 — 절대 커밋 금지
+scripts/.flex-profile
+scripts/login-failed.png

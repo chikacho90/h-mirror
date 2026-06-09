@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>uk.wooo.h-mirror.flex-sync</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/woo/.bun/bin/bun</string>
+    <string>run</string>
+    <string>sync</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/woo/Projects/h-mirror</string>
+
+  <!-- 스크립트는 기본 창 모드(화면 밖)로 동작 — 구글이 헤드리스를 본인인증으로 막으므로
+       세션 만료 시에도 창 모드여야 무인 재로그인됨. (HEADLESS=1 주면 창 없이 헤드리스) -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/Users/woo/.bun/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <!-- 매일 09:30 실행 -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>9</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+
+  <!-- 예약 시각에 Mac이 꺼져있었으면 켜진 직후 한 번 실행 -->
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/woo/Projects/h-mirror/scripts/flex-sync.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/woo/Projects/h-mirror/scripts/flex-sync.log</string>
+</dict>
+</plist>
