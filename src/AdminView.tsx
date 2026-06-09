@@ -68,6 +68,29 @@ export function AdminView() {
     }
   }
 
+  // 추정 이름이 달린 그룹을 각자 추정 이름으로 한 번에 승인
+  async function handleApproveAllHinted() {
+    const hinted = pendingClusters
+      .map((c) => ({ c, h: clusterHint(c) }))
+      .filter((x): x is { c: PendingCaptureWithEmbedding[]; h: { name: string; sim: number } } => x.h !== null)
+    if (hinted.length === 0) return
+    if (!confirm(`추정 이름이 있는 ${hinted.length}개 그룹을 각 추정 이름으로 일괄 승인할까요?`)) return
+    try {
+      for (const { c, h } of hinted) {
+        await assignPendingClusterToName({
+          ids: c.map((x) => x.id),
+          embeddings: c.map((x) => x.embedding),
+          image_datas: c.map((x) => x.image_data),
+          name: h.name,
+        })
+      }
+      setMessage({ text: `${hinted.length}개 그룹을 추정 이름으로 일괄 승인`, ok: true })
+      await refresh()
+    } catch (e) {
+      setMessage({ text: `Bulk approve failed: ${e instanceof Error ? e.message : String(e)}`, ok: false })
+    }
+  }
+
   async function handleDeleteCluster(cluster: PendingCaptureWithEmbedding[]) {
     if (!confirm(`이 그룹 ${cluster.length}장을 삭제할까요?`)) return
     try {
@@ -152,6 +175,11 @@ export function AdminView() {
                     {pending.length}장 · {pendingClusters.length}그룹 (유사도로 자동 묶임)
                   </div>
                 </div>
+                {pendingClusters.some((c) => clusterHint(c)) && (
+                  <button type="button" onClick={handleApproveAllHinted} style={hintBtnStyle}>
+                    ✓ 추정 이름 그룹 전부 승인 ({pendingClusters.filter((c) => clusterHint(c)).length})
+                  </button>
+                )}
               </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 {pendingClusters.map((cluster, idx) => (
@@ -303,6 +331,20 @@ function clusterByEmbedding(
     .map((arr) => arr.map((idx) => items[idx]))
 }
 
+// 클러스터의 자동 추정 이름 + 평균 유사도 (auto_top_name 기준)
+function clusterHint(cluster: PendingCaptureWithEmbedding[]): { name: string; sim: number } | null {
+  const tally = new Map<string, { n: number; sum: number }>()
+  for (const c of cluster) {
+    if (!c.auto_top_name) continue
+    const t = tally.get(c.auto_top_name) ?? { n: 0, sum: 0 }
+    t.n += 1; t.sum += c.auto_top_similarity ?? 0
+    tally.set(c.auto_top_name, t)
+  }
+  if (tally.size === 0) return null
+  const best = Array.from(tally.entries()).sort((a, b) => b[1].n - a[1].n)[0]
+  return { name: best[0], sim: best[1].sum / best[1].n }
+}
+
 function ClusterCard(props: {
   cluster: PendingCaptureWithEmbedding[]
   index: number
@@ -314,15 +356,9 @@ function ClusterCard(props: {
   const [mode, setMode] = useState<'closed' | 'assign'>('closed')
   const [draft, setDraft] = useState('')
 
-  // 클러스터의 자동 태그 힌트 — 가장 자주 나온 auto_top_name
-  const hint = useMemo(() => {
-    const tally = new Map<string, number>()
-    for (const c of cluster) {
-      if (c.auto_top_name) tally.set(c.auto_top_name, (tally.get(c.auto_top_name) || 0) + 1)
-    }
-    if (tally.size === 0) return null
-    return Array.from(tally.entries()).sort((a, b) => b[1] - a[1])[0][0]
-  }, [cluster])
+  // 클러스터의 자동 추정 — 가장 자주 나온 auto_top_name + 평균 유사도
+  const hint = useMemo(() => clusterHint(cluster), [cluster])
+  const hintPct = hint ? `${(hint.sim * 100).toFixed(0)}%` : ''
 
   const listId = `cluster-names-${index}`
 
@@ -330,14 +366,14 @@ function ClusterCard(props: {
     <div style={clusterCardStyle}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
         <div style={{ fontSize: 14, fontWeight: 600 }}>
-          그룹 #{index + 1} · {cluster.length}장 {hint && <span style={mutedStyle}>(추정: {hint})</span>}
+          그룹 #{index + 1} · {cluster.length}장 {hint && <span style={mutedStyle}>(추정: {hint.name} {hintPct})</span>}
         </div>
         <div style={{ display: 'flex', gap: 6 }}>
           {mode === 'closed' ? (
             <>
               {hint && (
-                <button type="button" onClick={() => onAssign(hint)} style={hintBtnStyle}>
-                  ✓ {hint}에 추가
+                <button type="button" onClick={() => onAssign(hint.name)} style={hintBtnStyle}>
+                  ✓ {hint.name} ({hintPct})에 추가
                 </button>
               )}
               <button type="button" onClick={() => { setMode('assign'); setDraft('') }} style={editBtnStyle}>
