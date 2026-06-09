@@ -9,7 +9,7 @@ import {
 import { AdminView } from './AdminView'
 import { ShutterModal, type ShutterShotState } from './ShutterModal'
 import { extractSingleEmbedding, loadFaceModels } from './lib/faceApi'
-import { autoCapture, matchFace, type MatchResult } from './lib/supabase'
+import { autoCapture, matchFace } from './lib/supabase'
 
 const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm'
 const OBJ_MODEL = 'https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite'
@@ -28,9 +28,12 @@ const FPS_UPDATE_MS = 500
 const FACE_REFRESH_MS = 700        // 얼굴 검출 + 임베딩 호출 주기 (≈1.4fps — DB 쿼리 부담 줄임)
 // RPC가 Euclidean 거리 기반 (face-api 표준). 같은 사람 80-100%, 닮은 60-80%, 무관 50% 이하
 // similarity = 1 - euclidean_distance (모든 후보에 동일 공식 = 같은 스케일)
-const MATCH_THRESHOLD = 0.0        // 임계 0 — 매칭 결과 받기만 함
-const MATCH_TOP_K = 10             // top-1만 보여도 dedupe 여유 위해 여러 개 가져옴
-const DISPLAY_TOP_N = 1            // top-1만 표시
+const MATCH_THRESHOLD = 0.0        // RPC 임계 0 — 후보를 받기만 하고 판정은 클라에서
+const MATCH_TOP_K = 10             // dedupe/융합 여유 위해 여러 개 가져옴
+// 다중 프레임 융합 — 한 트랙의 최근 매칭들을 모아 신원을 안정적으로 판정
+const IDENTITY_WINDOW_MS = 8000    // 최근 관측 유지 시간 (이 안의 매칭들로 신원 결정)
+const IDENTITY_MIN_OBS = 2         // 신원 확정에 필요한 최소 관측 수
+const IDENTITY_MIN_SIM = 0.50      // 평균 유사도 이 미만이면 'Unknown' (낯선 사람 오인식 방지)
 // 자동 캡쳐 — 메인페이지에 지나가는 사람들을 자동 분류 (높음=직접 추가 / 낮음=admin 후보 풀)
 const AUTO_CAPTURE_MIN_TRACK_AGE_MS = 1500   // 트랙이 안정될 때까지 기다림
 const AUTO_CAPTURE_COOLDOWN_MS = 30000       // 같은 트랙은 30초마다 1장만
@@ -45,13 +48,18 @@ type TargetMode = 'none' | 'full-body' | 'face'
 const DISPLAY_OPTIONS: ShapeMode[] = ['box', 'silhouette-bg', 'silhouette-fg', 'silhouette-outline']
 const TARGET_OPTIONS: TargetMode[] = ['full-body', 'face']
 
+// 한 프레임의 얼굴 매칭 관측 1건
+type IdObs = { name: string; id: string; sim: number; t: number }
+// 융합으로 확정된 신원 (트랙에 sticky 하게 유지)
+type Identity = { name: string; id: string; confidence: number }
 type Track = {
   id: number
   bbox: BBox
   score: number
   firstSeenAt: number
   lastSeenAt: number
-  matches: MatchResult[]
+  obs: IdObs[]              // 최근 매칭 관측들 (윈도우)
+  identity: Identity | null // 융합 신원 — 얼굴 안 보여도 유지
   lastFaceProcessedAt: number
 }
 
@@ -469,7 +477,8 @@ function updateTracks(
       score: det.score,
       firstSeenAt: now,
       lastSeenAt: now,
-      matches: [],
+      obs: [],
+      identity: null,
       lastFaceProcessedAt: 0,
     })
   }
@@ -521,50 +530,77 @@ async function processFaceMatching(
     tmpCanvas.height = Math.round(sh)
     tmpCtx.drawImage(video, sx, sy, sw, sh, 0, 0, tmpCanvas.width, tmpCanvas.height)
 
-    let detection: Awaited<ReturnType<typeof extractSingleEmbedding>>
+    let detection: Awaited<ReturnType<typeof extractSingleEmbedding>> = null
     try {
       detection = await extractSingleEmbedding(tmpCanvas)
     } catch {
-      continue
-    }
-    if (!detection) continue
-
-    // detection.box 좌표를 video 원본 좌표로 환산
-    const originalBox = {
-      x: sx + detection.box.x,
-      y: sy + detection.box.y,
-      width: detection.box.width,
-      height: detection.box.height,
+      detection = null
     }
 
-    try {
-      const results = await matchFace(Array.from(detection.descriptor), MATCH_TOP_K, MATCH_THRESHOLD)
-      track.matches = results
-      track.lastFaceProcessedAt = performance.now()
-    } catch {
-      // skip on transient errors
-    }
+    if (detection) {
+      // detection.box 좌표를 video 원본 좌표로 환산
+      const originalBox = {
+        x: sx + detection.box.x,
+        y: sy + detection.box.y,
+        width: detection.box.width,
+        height: detection.box.height,
+      }
 
-    // 자동 캡쳐 — 트랙 안정 + cooldown OK + 얼굴 충분히 큰 경우
-    const trackAge = now - track.firstSeenAt
-    const lastCap = autoCfg.cooldown.get(track.id) ?? 0
-    if (
-      trackAge >= AUTO_CAPTURE_MIN_TRACK_AGE_MS &&
-      now - lastCap >= AUTO_CAPTURE_COOLDOWN_MS &&
-      originalBox.width >= AUTO_CAPTURE_MIN_FACE_PX
-    ) {
-      autoCfg.cooldown.set(track.id, now)
-      const thumb = cropFaceThumb(video, originalBox)
-      const top = track.matches[0]
-      // fire-and-forget — UI 안 막음. autoCapture가 신뢰도 보고 직접추가/pending 분기
-      autoCapture({
-        embedding: Array.from(detection.descriptor),
-        image_data: thumb,
-        topMatch: top ? { name: top.name, similarity: top.similarity } : null,
-        highConfThreshold: AUTO_CAPTURE_HIGH_CONF,
-      }).catch(() => { /* skip */ })
+      try {
+        const results = await matchFace(Array.from(detection.descriptor), MATCH_TOP_K, MATCH_THRESHOLD)
+        if (results.length > 0) {
+          const top = results[0]
+          track.obs.push({ name: top.name, id: top.id, sim: top.similarity, t: performance.now() })
+        }
+        track.lastFaceProcessedAt = performance.now()
+      } catch {
+        // skip on transient errors
+      }
+
+      // 누적 관측으로 신원 융합 (얼굴 안 보여도 sticky 유지)
+      resolveIdentity(track, performance.now())
+
+      // 자동 캡쳐 — 트랙 안정 + cooldown OK + 얼굴 충분히 큰 경우. 융합 신원으로 귀속.
+      const trackAge = now - track.firstSeenAt
+      const lastCap = autoCfg.cooldown.get(track.id) ?? 0
+      if (
+        trackAge >= AUTO_CAPTURE_MIN_TRACK_AGE_MS &&
+        now - lastCap >= AUTO_CAPTURE_COOLDOWN_MS &&
+        originalBox.width >= AUTO_CAPTURE_MIN_FACE_PX
+      ) {
+        autoCfg.cooldown.set(track.id, now)
+        const thumb = cropFaceThumb(video, originalBox)
+        const id = track.identity
+        // fire-and-forget — UI 안 막음. autoCapture가 신뢰도 보고 직접추가/pending 분기
+        autoCapture({
+          embedding: Array.from(detection.descriptor),
+          image_data: thumb,
+          topMatch: id ? { name: id.name, similarity: id.confidence } : null,
+          highConfThreshold: AUTO_CAPTURE_HIGH_CONF,
+        }).catch(() => { /* skip */ })
+      }
+    } else {
+      resolveIdentity(track, performance.now())  // 얼굴 못 잡아도 윈도우 정리 + 기존 신원 유지
     }
   }
+}
+
+// 최근 관측(obs)을 모아 트랙의 신원을 판정. 충분한 근거 없으면 기존 신원을 유지(sticky).
+function resolveIdentity(track: Track, now: number) {
+  track.obs = track.obs.filter((o) => now - o.t <= IDENTITY_WINDOW_MS)
+  if (track.obs.length === 0) return // 관측 없음 → 직전 신원 유지
+  const agg = new Map<string, { name: string; id: string; score: number; n: number }>()
+  for (const o of track.obs) {
+    const a = agg.get(o.name) ?? { name: o.name, id: o.id, score: 0, n: 0 }
+    a.score += o.sim; a.n += 1
+    agg.set(o.name, a)
+  }
+  let best: { name: string; id: string; score: number; n: number } | null = null
+  for (const a of agg.values()) if (!best || a.score > best.score) best = a
+  if (best && best.n >= IDENTITY_MIN_OBS && best.score / best.n >= IDENTITY_MIN_SIM) {
+    track.identity = { name: best.name, id: best.id, confidence: best.score / best.n }
+  }
+  // 근거 부족 시 track.identity는 그대로 유지(이전 확정값) — 깜빡임 방지
 }
 
 function cropFaceThumb(video: HTMLVideoElement, box: { x: number; y: number; width: number; height: number }): string {
@@ -607,38 +643,23 @@ function drawIdentityLabel(
   const yTop = Math.max(28, t.bbox.y)
   const color = colorForId(t.id)
 
-  // 매칭 결과 — 이름 기준 dedupe 후 unique top-3
-  const dedup: { name: string; similarity: number }[] = []
-  for (const m of t.matches) {
-    if (!dedup.find((d) => d.name === m.name)) dedup.push(m)
-    if (dedup.length >= DISPLAY_TOP_N) break
-  }
-
   ctx.save()
   const primaryFont = 'bold 20px ui-sans-serif, system-ui, sans-serif'
-  const otherFont = '13px ui-sans-serif, system-ui, sans-serif'
-  const GAP = 12   // top-1 ↔ top-2/3 사이 가로 간격
-
-  // 한 줄에 top-3: top-1 강조(큰글씨) + GAP + top-2,3 inline
   const padX = 14
   const padY = 8
   const headH = 26
 
-  let primaryText = ''
-  if (dedup.length > 0) {
-    primaryText = `${dedup[0].name} (${(dedup[0].similarity * 100).toFixed(0)}%)`
+  // 융합 신원이 있으면 표시, 없으면 Searching/Unknown
+  let primaryText: string
+  if (t.identity) {
+    primaryText = `${t.identity.name} (${(t.identity.confidence * 100).toFixed(0)}%)`
   } else {
     primaryText = t.lastFaceProcessedAt === 0 ? 'Searching…' : 'Unknown'
   }
-  const others = dedup.slice(1)
-  const othersText = others.map((d) => `${d.name} (${(d.similarity * 100).toFixed(0)}%)`).join('   ')
 
   ctx.font = primaryFont
   const primaryW = ctx.measureText(primaryText).width
-  ctx.font = otherFont
-  const othersW = othersText ? ctx.measureText(othersText).width : 0
-  const contentW = primaryW + (othersText ? GAP + othersW : 0)
-  const boxW = contentW + padX * 2
+  const boxW = primaryW + padX * 2
   const boxH = padY + headH + padY
 
   let bx = cx - boxW / 2
@@ -654,15 +675,9 @@ function drawIdentityLabel(
   ctx.strokeRect(bx, by, boxW, boxH)
 
   ctx.textBaseline = 'alphabetic'
-  const textY = by + padY + 20    // baseline 위치 (20px 글씨 기준)
   ctx.font = primaryFont
   ctx.fillStyle = '#fff'
-  ctx.fillText(primaryText, bx + padX, textY)
-  if (othersText) {
-    ctx.font = otherFont
-    ctx.fillStyle = '#aaa'
-    ctx.fillText(othersText, bx + padX + primaryW + GAP, textY)
-  }
+  ctx.fillText(primaryText, bx + padX, by + padY + 20)
   ctx.restore()
 }
 
