@@ -101,7 +101,7 @@ async function main() {
   if (targets.length === 0) return
 
   console.log('🌐 face-api(headless) 로딩…')
-  const browser = await chromium.launch({ headless: true })
+  const browser = await chromium.launch({ headless: true, channel: 'chrome' })
   const page = await browser.newPage()
   await page.setContent(`<!doctype html><html><head>
 <script src="https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.15/dist/face-api.js"></script>
